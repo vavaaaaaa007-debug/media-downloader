@@ -120,8 +120,12 @@ def _publish_download(src, dest):
             k += 1
             candidate = "%s(%d)%s" % (stem, k, suffix)
         except OSError as e:
-            if e.errno not in {errno.EPERM, errno.EXDEV, errno.ENOSYS,
-                               errno.ENOTSUP, errno.EOPNOTSUPP}:
+            # 某些 Windows 网络盘/同步盘对硬链接返回 WinError 1（函数不正确），
+            # 这类文件系统仍可通过排他复制完成发布。
+            unsupported_link = getattr(e, "winerror", None) == 1
+            if (not unsupported_link and
+                    e.errno not in {errno.EPERM, errno.EXDEV, errno.ENOSYS,
+                                    errno.ENOTSUP, errno.EOPNOTSUPP}):
                 raise
             # exFAT 等不支持硬链接：排他创建仍保证不覆盖，但复制完成前可见。
             try:
