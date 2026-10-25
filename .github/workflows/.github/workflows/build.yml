@@ -1,0 +1,82 @@
+name: Build desktop apps
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUTF8: '1'
+  PYTHONIOENCODING: utf-8
+  PIP_DISABLE_PIP_VERSION_CHECK: '1'
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: windows-x64
+            runner: windows-2022
+            python-arch: x64
+          - target: macos-arm64
+            runner: macos-15
+            python-arch: arm64
+          - target: macos-x64
+            runner: macos-15-intel
+            python-arch: x64
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.13'
+          architecture: ${{ matrix.python-arch }}
+
+      - name: Install project dependencies
+        run: |
+          python -m pip install -r requirements-build.txt
+          python -m pip check
+          python -c "import tkinter; print('Tk:', tkinter.TkVersion)"
+
+      - name: Run regression tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Build Windows executable
+        if: runner.os == 'Windows'
+        run: >-
+          python -m PyInstaller --clean --noconfirm --onefile --windowed
+          --name "媒体下载器" --icon assets/app.ico
+          --specpath build/spec-windows --workpath build/windows
+          drive_image_downloader.py
+
+      - name: Build macOS application
+        if: runner.os == 'macOS'
+        run: python -m PyInstaller --clean --noconfirm 媒体下载器.spec
+
+      - name: Verify and package application
+        env:
+          BUILD_TARGET: ${{ matrix.target }}
+        run: python scripts/package_artifact.py --target "$BUILD_TARGET"
+
+      - name: Upload downloadable build
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: media-downloader-${{ matrix.target }}
+          path: release/*
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
