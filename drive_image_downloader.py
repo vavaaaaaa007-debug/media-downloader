@@ -423,7 +423,12 @@ def download_file(file_id, dest_path, progress_cb=None, chunk=65536, stop_check=
                 os.remove(tmp_path)
         except Exception:
             pass
-        return False, "下载失败：请检查网络、磁盘空间与文件夹权限"
+        # 保留简短、可操作的错误原因，避免所有失败都显示同一条模糊提示。
+        detail = str(e).strip().replace("\r", " ").replace("\n", " ")
+        if len(detail) > 240:
+            detail = detail[:237] + "..."
+        return False, ("下载失败：" + detail if detail else
+                       "下载失败：请检查网络、磁盘空间与文件夹权限")
     finally:
         if resp is not None:
             try:
