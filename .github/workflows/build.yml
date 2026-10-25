@@ -59,7 +59,7 @@ jobs:
         if: runner.os == 'Windows'
         run: >-
           python -m PyInstaller --clean --noconfirm --onefile --windowed
-          --name "媒体下载器" --icon assets/app.ico
+          --name "媒体下载器" --icon "$GITHUB_WORKSPACE/assets/app.ico"
           --specpath build/spec-windows --workpath build/windows
           drive_image_downloader.py
 
