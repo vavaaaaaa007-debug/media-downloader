@@ -1,0 +1,74 @@
+媒体下载器 —— 使用说明
+================================
+
+一、需要什么
+  需要 Python 3.10 或更新版本和 Tkinter。
+  Google Drive 下载先安装项目安全证书库：
+      python3 -m pip install -r requirements-runtime.txt
+  Facebook 下载先安装 requirements-facebook.txt（包含同一安全证书库）。
+  Windows 命令中的 python3 可改为 python。
+  请使用所选 Python 分支的最新安全补丁版本（Windows / Mac / Linux 均可）。
+
+二、怎么运行
+  Windows：双击 drive_image_downloader.py
+    （如果双击没反应：右键 → 打开方式 → 选择 Python）
+  Mac / Linux：在终端执行  python3 drive_image_downloader.py
+
+三、怎么用
+  1. 把链接粘贴进文本框里，每行一个，按粘贴顺序下载：
+       • Google Drive 分享链接（图片、视频都行）
+       • Facebook Reels 链接（https://www.facebook.com/reel/xxx 这种）
+     两种链接可以混在一起粘贴，都会按顺序编号。
+     重复粘贴的同一链接会逐行下载，各占一个序号。
+  2. 在"起始序号"里填数字，再选"序号位数"：
+       起始序号=1、选"2位（01）" → 01.jpg、02.jpg、03.jpg……
+       （Facebook Reels 下载后为 01.mp4、02.mp4……）
+       起始序号=23、选"不补零"  → 23.jpg、24.jpg、25.jpg……
+  3. 选择保存文件夹，点"开始下载"。
+  4. 下载完点"打开保存文件夹"查看。
+  5. 单文件上限默认 2 GB（1 GB = 1024³ 字节），可调大；填 0 表示不限。
+     超过上限的文件不会发布为下载结果，临时文件会清理。
+
+四、注意事项
+  - 链接必须是"任何有链接的人可查看"的公开分享链接，私密文件下载不了。
+  - 下载 Facebook Reels 需要先安装 yt-dlp（只需安装一次）：
+      Mac / Linux：打开终端执行  python3 -m pip install -r requirements-facebook.txt
+      Windows：在 cmd 里执行  python -m pip install -r requirements-facebook.txt
+    如果没装就粘贴了 Facebook 链接，软件会弹窗提醒。
+  - 下载顺序 = 粘贴顺序，请按想要的序号顺序粘贴。
+  - 如果同名文件已存在，会自动改成 01(1).jpg，不会覆盖。
+  - Google 对公开下载有配额限制，如果某天突然全部失败，过几小时再试。
+  - 大文件（超过约 100MB）会自动处理谷歌的确认页，一般图片用不到。
+
+五、安全说明（2026-10-25）
+  - 文件按起始序号和序号位数自动命名，例如 01.jpg、02.mp4。
+  - Facebook 链接需为完整 HTTPS 地址。
+  - 未识别的文件类型保存为 .bin，内容不会转换。
+  - 批量下载按实际下载响应确定后缀，避免探测和正文类型不一致。
+  - SVG 仍可下载，但在保存前会提示；拒绝则跳过该文件。
+    只打开可信来源文件；提醒依据响应类型和后缀，不是内容杀毒或完整格式验证。
+  - 临时文件随机隔离，不覆盖已有文件或符号链接；不支持硬链接的磁盘使用排他复制，复制完成前文件可见。
+  - 支持 POSIX 权限的 Mac / Linux 文件系统上，成品发布前设为仅当前用户读写（0600）。
+    Windows 的 ACL、exFAT 等文件系统的挂载权限仍需由保存目录和系统配置控制。
+  - Google Drive 下载重定向只允许 Google 下载域名及 HTTPS。
+  - Google Drive 和 Facebook 使用已更新的项目证书库；不会修改系统证书库。
+    企业代理若依赖自签名根，可能需另外安排受控的证书配置；不要关闭 TLS 校验。
+  - 推荐在项目虚拟环境安装依赖。修改源码不会更新已有 dist 应用。
+  - Facebook 提取器的原始错误不会写入终端，以免泄露带令牌的媒体链接。
+  - 回归测试：python3 -m unittest discover -s tests -v
+  - 构建：python3 -m PyInstaller --clean --noconfirm 媒体下载器.spec
+  - 调用 Python API 时，max_bytes=0 表示不限，SVG 必须通过 svg_confirm 回调明确同意。
+    download_batch 的 start_number 必须传整数，路径文本、布尔值等会在下载前拒绝。
+  - 请保存到自己控制的目录；不能防御同账号恶意程序或其他写入者事后替换成品文件。
+  - yt-dlp 默认会加载本地插件；不使用插件时，可在启动前设置 YTDLP_NO_PLUGINS=1。
+
+六、Mac 带图标打包
+  - 已接入葡萄紫云朵＋柠檬黄下载箭头图标：assets/app.icns。
+  - 双击项目里的 Mac一键打包.command 即可；或在终端进入项目目录后执行：
+      zsh Mac一键打包.command
+  - 脚本会创建/使用项目 .venv，安装 requirements-build.txt、检查依赖、运行测试。
+    只有这些步骤成功后才执行 PyInstaller；不会修改系统 Python 的全局依赖。
+  - 完成后在项目 dist 目录找到 媒体下载器.app。
+  - 图标路径已写入 媒体下载器.spec，之后打包会自动带上图标。
+  - 生成的是构建所用 Mac 架构的应用；此脚本不生成 Windows .exe。
+  - 构建成功不等于 GUI 与真实下载都已验证，请在正常桌面会话测试后再分发。

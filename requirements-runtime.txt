@@ -1,0 +1,2 @@
+# Shared HTTPS trust store for Drive and Facebook downloads.
+certifi==2026.10.23

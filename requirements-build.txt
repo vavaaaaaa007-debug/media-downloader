@@ -1,0 +1,11 @@
+-r requirements-facebook.txt
+PyInstaller==6.22.3
+pyinstaller-hooks-contrib==2026.8
+altgraph==0.17.5
+macholib==1.16.4; sys_platform == "darwin"
+packaging==26.3
+# Existing audited baseline; no major-version upgrade is performed here.
+setuptools==84.1.0
+# Pin PyInstaller's Windows-only build dependencies as well.
+pefile==2024.8.26; sys_platform == "win32"
+pywin32-ctypes==0.2.3; sys_platform == "win32"
