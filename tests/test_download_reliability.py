@@ -72,6 +72,72 @@ class FailureReasonTests(unittest.TestCase):
         self.assertGreaterEqual(opener.call_count, 2)
 
 
+class LoggingAndTimeoutTests(unittest.TestCase):
+    def test_connection_timeout_is_explained_with_stage_logs(self):
+        import socket
+        logs = []
+        with tempfile.TemporaryDirectory() as d, patch.object(
+                app, "_open_drive_url", side_effect=socket.timeout("timed out")):
+            ok, message = app.download_file("abcdefghij", os.path.join(d, "01.jpg"),
+                                            log_cb=logs.append)
+        self.assertFalse(ok)
+        self.assertIn("没有收到谷歌的响应", message)
+        self.assertIn("代理", message)
+        self.assertEqual(sum("正在连接谷歌" in l for l in logs), 2)  # 两个地址都试过
+        self.assertTrue(any("连接失败" in l for l in logs))
+
+    def test_timeout_mid_download_has_clear_message(self):
+        import socket
+
+        class Stalls(io.BytesIO):
+            headers = {"Content-Type": "image/jpeg", "Content-Length": "100"}
+
+            def read(self, *a):
+                raise socket.timeout("timed out")
+
+        with tempfile.TemporaryDirectory() as d, \
+                patch.object(app, "_open_drive_url", return_value=Stalls()):
+            ok, message = app.download_file("abcdefghij", os.path.join(d, "01.jpg"))
+            self.assertEqual(list(Path(d).iterdir()), [])
+        self.assertFalse(ok)
+        self.assertIn("没有收到数据", message)
+
+    def test_progress_and_stage_logs_for_successful_download(self):
+        logs = []
+
+        class Body(io.BytesIO):
+            headers = {"Content-Type": "image/jpeg", "Content-Length": "6"}
+
+        ticks = iter([0, 0, 0, 6, 6, 6, 6, 6])
+        with tempfile.TemporaryDirectory() as d, \
+                patch.object(app, "_open_drive_url", return_value=Body(b"abcdef")), \
+                patch.object(app.time, "monotonic", side_effect=lambda: next(ticks, 100)):
+            ok, info = app.download_file("abcdefghij", os.path.join(d, "01.jpg"),
+                                         log_cb=logs.append, chunk=3)
+        self.assertTrue(ok, info)
+        joined = "\n".join(logs)
+        self.assertIn("已连接", joined)
+        self.assertIn("开始接收文件：类型 image/jpeg，大小 6 B", joined)
+        self.assertIn("已下载", joined)
+
+    def test_run_plan_logs_each_item_and_wait(self):
+        logs = []
+        with tempfile.TemporaryDirectory() as d, \
+                patch.object(app, "download_file", side_effect=lambda f, dest, **k: (False, "x")), \
+                patch.object(app, "_pause"):
+            app.download_batch([A, B], 1, d, delay=2, log_cb=logs.append)
+        joined = "\n".join(logs)
+        self.assertIn("开始 序号 1（Drive …/d/aaaaaaaaaa…）", joined)
+        self.assertIn("序号 1 结束，用时", joined)
+        self.assertIn("等待", joined)
+
+    def test_size_formatting(self):
+        self.assertEqual(app._fmt_size(None), "未知")
+        self.assertEqual(app._fmt_size(500), "500 B")
+        self.assertEqual(app._fmt_size(1536), "1.5 KB")
+        self.assertEqual(app._fmt_size(5 * 1024 ** 2), "5.0 MB")
+
+
 class BatchReliabilityTests(unittest.TestCase):
     def test_same_link_requested_once_and_copied_with_new_names(self):
         links = ['"%s' % A, B + '"', '"%s' % A, B + '"', A]
@@ -158,6 +224,58 @@ class BatchReliabilityTests(unittest.TestCase):
         self.assertEqual([e["valid"] for e in plan["entries"]], [True, False, True, True])
         self.assertEqual(plan["group_titles"], ["05", "06"])
         self.assertEqual(len(plan["items"]), 3)
+
+
+class StartNumberTests(unittest.TestCase):
+    def test_parse_start(self):
+        for text, expected in (("3", (3, None)), ("03", (3, None)), (" 03-2 ", (3, 2)),
+                               ("01－1", (1, 1)), ("7—12", (7, 12)), ("-1", (-1, None)),
+                               ("0", (0, None))):
+            with self.subTest(text=text):
+                self.assertEqual(app.parse_start(text), expected)
+        for bad in ("", "a", "3-", "3-0", "1-2-3", "3 2", "03-a", None):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                app.parse_start(bad)
+
+    def tags(self, links, start, sub, **kw):
+        plan = app.build_plan(links, start, zero_pad=2, start_sub=sub, **kw)
+        return [e["tag"] for e in plan["entries"]]
+
+    def test_first_series_continues_then_normal_numbering(self):
+        self.assertEqual(self.tags(['"%s' % A, B + '"', C], 3, 2), ["03-2", "03-3", "04"])
+
+    def test_single_first_group_still_gets_suffix_when_continuing(self):
+        self.assertEqual(self.tags([A, '"%s' % B, C + '"'], 3, 2), ["03-2", "04-1", "04-2"])
+        plan = app.build_plan([A], 3, zero_pad=2, start_sub=2)
+        self.assertEqual(plan["items"][0]["label"], "03-2")
+        self.assertTrue(plan["items"][0]["suffix"])
+
+    def test_sub_start_applies_to_first_valid_group_only(self):
+        self.assertEqual(self.tags(["oops", "", A, B], 5, 1), ["—", "05-1", "06"])
+        self.assertEqual(self.tags(['"%s' % A, B + '"'], 1, 1), ["01-1", "01-2"])
+
+    def test_sub_padding_follows_largest_number_in_series(self):
+        ids = [U % ("%012d" % i) for i in range(6)]
+        lines = ['"' + ids[0]] + ids[1:-1] + [ids[-1] + '"']
+        tags = self.tags(lines, 3, 5)
+        self.assertEqual(tags[0], "03-05")
+        self.assertEqual(tags[-1], "03-10")
+
+    def test_without_sub_behaviour_is_unchanged(self):
+        self.assertEqual(self.tags([A, B], 1, None), ["01", "02"])
+
+    def test_invalid_sub_rejected(self):
+        for bad in (0, -1, 1.5, "2", True):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                app.build_plan([A], 1, start_sub=bad)
+
+    def test_download_batch_uses_sub_start_for_file_names(self):
+        seen = []
+        with tempfile.TemporaryDirectory() as d, patch.object(
+                app, "download_file",
+                side_effect=lambda f, dest, **k: (seen.append(os.path.basename(dest)), (False, "x"))[1]):
+            app.download_batch(['"%s' % A, B + '"', C], 3, d, zero_pad=2, start_sub=2)
+        self.assertEqual(seen, ["03-2.bin", "03-3.bin", "04.bin"])
 
 
 class SettingsTests(unittest.TestCase):

@@ -20,6 +20,7 @@ class FakeTclError(Exception):
 
 class FakeWidget:
     counter = 0
+    delayed = []
 
     def __init__(self, *args, **kwargs):
         self.args, self.kwargs = args, kwargs
@@ -52,8 +53,13 @@ class FakeWidget:
         return None
 
     def after(self, ms, fn=None, *a):
-        if fn:
-            fn()  # 测试里同步执行
+        if fn is None:
+            return None
+        if ms == 0:
+            fn()  # 立即要做的事在测试里同步执行
+        else:
+            FakeWidget.delayed.append((ms, fn))  # 延时任务只记录，不执行
+        return None
 
     def clipboard_get(self):
         return self.clip
@@ -208,6 +214,81 @@ class UiSmokeTests(unittest.TestCase):
         self.assertEqual(self.app.plan["group_titles"][0], "001")
         self.app.start_var.set("29")
         self.assertEqual(self.app.plan["group_titles"][0], "029")
+
+    def test_start_with_series_suffix_renames_first_series(self):
+        self.app.root.clip = '"%s\n%s"\n%s' % (IDS["a"], IDS["b"], IDS["c"])
+        self.app._on_paste_click()
+        self.app.start_var.set("03-2")
+        tags = [e["tag"] for e in self.app.plan["entries"]]
+        self.assertEqual(tags, ["03-2", "03-3", "04"])
+        self.assertEqual(ui.summarize(self.app.plan), (1, 1, 3))
+        with patch.object(backend, "download_file", side_effect=self.fake_download()):
+            self.app._on_start()
+        self.assertEqual(sorted(p.name for p in Path(self.dir.name).iterdir()),
+                         ["03-2.jpg", "03-3.jpg", "04.jpg"])
+
+    def test_single_file_continuing_series_counts_as_series_in_summary(self):
+        self.app.root.clip = IDS["a"]
+        self.app._on_paste_click()
+        self.app.start_var.set("03-2")
+        self.assertEqual([e["tag"] for e in self.app.plan["entries"]], ["03-2"])
+        self.assertEqual(ui.summarize(self.app.plan), (1, 0, 1))
+
+    def test_bad_start_text_is_reported_and_preview_still_works(self):
+        self.app._on_paste_click()
+        self.app.start_var.set("abc")
+        self.assertEqual(self.app.plan["group_titles"][0], "01")  # 预览退回默认，不崩溃
+        self.app._on_start()
+        self.assertEqual(self.box.calls[-1][0], "showerror")
+        self.assertIn("03-2", self.box.calls[-1][1])
+        self.assertFalse(self.app.running)
+
+    def test_live_log_lines_have_timestamps_and_reach_the_log(self):
+        self.app._on_paste_click()
+        lines = []
+        self.app._log_write = lambda text, tag=None, clear=False: lines.append(text)
+
+        def fake(fid, dest, log_cb=None, **kw):
+            log_cb("正在连接谷歌（地址 1/2）…")
+            final = dest[:-4] + ".jpg"
+            Path(final).write_bytes(b"x")
+            return True, final
+
+        with patch.object(backend, "download_file", side_effect=fake):
+            self.app._on_start()
+        joined = "\n".join(lines)
+        self.assertIn("正在连接谷歌（地址 1/2）…", joined)
+        self.assertIn("[成功] 序号 01-1 -> 01-1.jpg", joined)
+        self.assertRegex(lines[1], r"^\[\d\d:\d\d:\d\d\] ")
+
+    def test_heartbeat_explains_long_silence(self):
+        lines = []
+        self.app._log_line = lines.append
+        self.app.running = True
+        now = ui.time.monotonic()
+        self.app._last_activity = now - 12
+        self.app._last_heartbeat = 0.0
+        self.app._tick()
+        self.assertIn("仍在等待服务器响应", lines[-1])
+        self.assertNotIn("代理", lines[-1])
+        self.app._last_activity = now - 40
+        self.app._last_heartbeat = 0.0
+        self.app._tick()
+        self.assertIn("代理", lines[-1])
+        before = len(lines)
+        self.app._tick()  # 刚提示过，10 秒内不重复
+        self.assertEqual(len(lines), before)
+        self.app.running = False
+        self.app._tick()
+        self.assertEqual(len(lines), before)
+
+    def test_copy_log_puts_text_on_clipboard(self):
+        copied = []
+        self.app.root.clipboard_clear = lambda: copied.clear()
+        self.app.root.clipboard_append = copied.append
+        self.app.log.get = lambda *a: "[12:00:00] hello\n"
+        self.app._copy_log()
+        self.assertEqual(copied, ["[12:00:00] hello"])
 
     def test_garbage_paste_is_rejected(self):
         self.app.root.clip = "hello world"

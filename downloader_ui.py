@@ -140,12 +140,14 @@ def fit_text(font, text, max_width):
 
 def summarize(plan):
     """(系列数, 单文件数, 可下载文件数)。"""
-    sizes = {}
+    sizes, suffixed = {}, set()
     for e in plan["entries"]:
         sizes[e["group"]] = e["size"]
+        if e.get("suffix"):
+            suffixed.add(e["group"])
     valid_groups = {e["group"] for e in plan["items"]}
-    series = sum(1 for g in valid_groups if sizes[g] > 1)
-    singles = sum(1 for g in valid_groups if sizes[g] == 1)
+    series = sum(1 for g in valid_groups if sizes[g] > 1 or g in suffixed)
+    singles = len(valid_groups) - series
     return series, singles, len(plan["items"])
 
 
@@ -470,7 +472,7 @@ class CardList:
         c = self.canvas
         c.create_polygon(rounded_points(x, y, x + w, y + h, 12), smooth=True,
                          fill=FIELD, outline=BORDER)
-        multi = len(rows) > 1
+        multi = len(rows) > 1 or any(r.get("suffix") for r in rows)
         bw = self.bold.measure(title) + 18
         by = y + CARD_PAD
         c.create_polygon(rounded_points(x + 10, by, x + 10 + bw, by + 20, 10), smooth=True,
@@ -488,7 +490,7 @@ class CardList:
             text, color = self.status.get(e["index"], ("", TEXT3))
             if not e["valid"]:
                 text, color = "无法识别", ERR
-            status_w = max(self.small.measure("下载中"), self.small.measure("无法识别")) + 6
+            status_w = max(self.small.measure("下载中 100%"), self.small.measure("无法识别")) + 6
             c.create_text(x + 10 + label_w, cy, anchor="w", font=self.mono, fill=TEXT2,
                           text=fit_text(self.mono, link, w - 20 - label_w - status_w))
             item = c.create_text(x + w - 10, cy, anchor="e", font=self.small, fill=color, text=text)
@@ -546,8 +548,8 @@ class App:
         root = self.root
         root.title("媒体下载器")
         root.configure(bg=BG)
-        root.geometry("700x740")
-        root.minsize(640, 660)
+        root.geometry("700x800")
+        root.minsize(640, 700)
 
         family = _pick_font(root, ["PingFang SC", "Microsoft YaHei UI", "Microsoft YaHei",
                                    "Noto Sans CJK SC", "Source Han Sans SC", "WenQuanYi Micro Hei"],
@@ -572,6 +574,8 @@ class App:
         self.stop_requested = False
         self.done_cache = {}      # 已下载过的链接，继续下载时不再重复请求
         self._last_key_paste = 0.0
+        self._last_activity = 0.0  # 最近一次收到日志/进度的时间，用来提示“仍在等待”
+        self._last_heartbeat = 0.0
 
         self._build_header()
         self._build_bottom()
@@ -619,7 +623,7 @@ class App:
 
         log_frame = tk.Frame(self.root, bg=BORDER, padx=1, pady=1)
         log_frame.pack(side="bottom", fill="x", padx=pad)
-        self.log = tk.Text(log_frame, height=4, wrap="word", font=self.f_mono, bg=FIELD,
+        self.log = tk.Text(log_frame, height=7, wrap="word", font=self.f_mono, bg=FIELD,
                            fg=TEXT2, relief="flat", bd=0, highlightthickness=0, padx=10, pady=8,
                            state="disabled")
         self.log.tag_configure("hint", foreground=TEXT3)
@@ -631,13 +635,18 @@ class App:
 
         self.progress = ProgressBar(self.root)
         self.progress.pack(side="bottom", fill="x", padx=pad, pady=(6, 10))
-        tk.Label(self.root, textvariable=self.status_var, bg=BG, fg=TEXT, font=self.f,
-                 anchor="w", justify="left", wraplength=640).pack(side="bottom", fill="x", padx=pad)
+        status_row = tk.Frame(self.root, bg=BG)
+        status_row.pack(side="bottom", fill="x", padx=pad)
+        self.btn_copylog = PillButton(status_row, "复制日志", self._copy_log, style="secondary",
+                                      width=80, height=26, font=self.f_small)
+        self.btn_copylog.pack(side="right")
+        tk.Label(status_row, textvariable=self.status_var, bg=BG, fg=TEXT, font=self.f,
+                 anchor="w", justify="left", wraplength=540).pack(side="left", fill="x", expand=True)
 
         row = tk.Frame(self.root, bg=BG)
         row.pack(side="bottom", fill="x", padx=pad, pady=(12, 12))
         tk.Label(row, text="2. 起始序号", bg=BG, fg=TEXT, font=self.f_bold).pack(side="left")
-        PillEntry(row, self.start_var, width=44, font=self.f, parent_bg=BG).pack(side="left", padx=(8, 0))
+        PillEntry(row, self.start_var, width=64, font=self.f, parent_bg=BG).pack(side="left", padx=(8, 0))
         tk.Label(row, text="位数", bg=BG, fg=TEXT, font=self.f).pack(side="left", padx=(12, 0))
         PillDropdown(row, PAD_CHOICES, self.pad_var, width=104, font=self.f, parent_bg=BG).pack(
             side="left", padx=(8, 0))
@@ -773,15 +782,16 @@ class App:
         self._show_empty()
 
     def _start_value(self):
+        """(序号, 系列内序号或 None)；格式不对时返回 None。"""
         try:
-            return int(self.start_var.get().strip())
+            return self.b.parse_start(self.start_var.get())
         except ValueError:
             return None
 
     def _make_plan(self, lines):
-        start = self._start_value()
-        return self.b.build_plan(lines, 1 if start is None else start, "",
-                                 PAD_VALUES.get(self.pad_var.get(), 0))
+        number, sub = self._start_value() or (1, None)
+        return self.b.build_plan(lines, number, "", PAD_VALUES.get(self.pad_var.get(), 0),
+                                 start_sub=sub)
 
     def _apply_plan(self, plan, keep_status=False):
         self.plan = plan
@@ -821,6 +831,29 @@ class App:
         self._log_write("点击“开始下载”后，这里会显示每个文件的结果：\n[成功] 序号 01-1 -> 01-1.jpg",
                         tag="hint", clear=True)
 
+    def _log_line(self, message):
+        self._log_write("[%s] %s" % (time.strftime("%H:%M:%S"), message))
+
+    def _copy_log(self):
+        text = self.log.get("1.0", "end").strip()
+        if not text:
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.status_var.set("日志已复制，可以直接粘贴发给别人查看")
+
+    def _tick(self):
+        """下载期间每 2 秒检查一次：很久没有任何动静时，在日志里说明正在等待。"""
+        if not self.running:
+            return
+        now = time.monotonic()
+        idle = now - self._last_activity
+        if idle >= 10 and now - self._last_heartbeat >= 10:
+            self._last_heartbeat = now
+            hint = "；如果一直没有进展，可能是网络无法访问谷歌，需要开启代理/VPN" if idle >= 30 else ""
+            self._log_line("仍在等待服务器响应（已 %d 秒没有新进展）%s" % (idle, hint))
+        self.root.after(2000, self._tick)
+
     def _log_clear(self):
         self.log.configure(state="normal")
         self.log.delete("1.0", "end")
@@ -850,9 +883,9 @@ class App:
         if not self.plan:
             messagebox.showwarning("提示", "请先粘贴至少一个链接。")
             return
-        start = self._start_value()
-        if start is None:
-            messagebox.showerror("错误", "起始序号必须是整数。")
+        if self._start_value() is None:
+            messagebox.showerror("错误", "起始序号格式不对。\n请输入数字，例如 1；"
+                                 "或像 03-2 这样，表示从 03 系列的第 2 个文件开始。")
             return
         pending = self._pending_items()
         if not pending:
@@ -882,16 +915,20 @@ class App:
             self.cards.set_status(it["index"], "等待")
         self.progress.set(0)
         self._log_clear()
+        self._last_activity = self._last_heartbeat = time.monotonic()
+        self.root.after(2000, self._tick)
+        self._log_line("开始下载 %d 个文件，保存到 %s" % (len(pending), out_dir))
         threading.Thread(target=self._worker, args=(pending, out_dir), daemon=True).start()
 
     def _worker(self, items, out_dir):
         ui = self.root.after
         total = len(items)
-        started = {"n": 0}  # status_cb 按顺序对每个文件调用一次
+        current = {"n": 0, "index": None, "msg": "", "t": 0.0}  # status_cb 按顺序对每个文件调用一次
 
         def on_status(msg):
-            index = items[min(started["n"], total - 1)]["index"]
-            started["n"] += 1
+            index = items[min(current["n"], total - 1)]["index"]
+            current.update(n=current["n"] + 1, index=index, msg=msg, t=0.0)
+            self._last_activity = time.monotonic()
 
             def mark():
                 self.status_var.set(msg)
@@ -899,9 +936,24 @@ class App:
                 self.cards.reveal(index)
             ui(0, mark)
 
+        def on_log(message):
+            self._last_activity = time.monotonic()
+            ui(0, lambda: self._log_line(message))
+
         def on_file_progress(i, n, done, size):
+            self._last_activity = time.monotonic()
             frac = (done / size) if size else 0
             ui(0, lambda: self.progress.set((i + frac) / max(n, 1) * 100))
+            now = time.monotonic()
+            if current["index"] is None or now - current["t"] < 0.4:
+                return
+            current["t"] = now
+            index = current["index"]
+            part = ("%d%%" % int(frac * 100)) if size else self.b._fmt_size(done)
+            detail = "%s / %s" % (self.b._fmt_size(done), self.b._fmt_size(size)) if size else part
+            msg = "%s · %s" % (current["msg"], detail)
+            ui(0, lambda: (self.cards.set_status(index, "下载中", "下载中 " + part),
+                           self.status_var.set(msg)))
 
         def on_overall(done, n):
             ui(0, lambda: self.progress.set(done / max(n, 1) * 100))
@@ -926,7 +978,7 @@ class App:
                 items, out_dir, status_cb=on_status, file_progress_cb=on_file_progress,
                 overall_progress_cb=on_overall, stop_flag=lambda: self.stop_requested,
                 max_bytes=self.b.DEFAULT_MAX_BYTES, svg_confirm=confirm_svg, delay=1.5,
-                result_cb=on_result, cache=self.done_cache)
+                result_cb=on_result, cache=self.done_cache, log_cb=on_log)
             ui(0, lambda: self._finish(count, total, out_dir, results))
         except Exception as e:  # 防止后台线程异常导致界面一直停在“下载中”
             ui(0, lambda: self._crash(e))
@@ -936,13 +988,13 @@ class App:
         if success:
             self.ok_set.add(index)
             self.cards.set_status(index, "完成", "✓ 完成")
-            self._log_write("[成功] 序号 %s -> %s" % (item["tag"], os.path.basename(info)))
+            self._log_line("[成功] 序号 %s -> %s" % (item["tag"], os.path.basename(info)))
         elif info == self.b._NOT_RUN_MESSAGE:
             self.cards.set_status(index, "等待", "未下载")
-            self._log_write("[未下载] 序号 %s" % item["tag"])
+            self._log_line("[未下载] 序号 %s" % item["tag"])
         else:
             self.cards.set_status(index, "失败", "✗ 失败")
-            self._log_write("[失败] 序号 %s -> %s" % (item["tag"], info))
+            self._log_line("[失败] 序号 %s -> %s" % (item["tag"], info))
 
     def _finish(self, count, total, out_dir, results):
         self.running = False
@@ -964,7 +1016,7 @@ class App:
     def _crash(self, error):
         self.running = False
         self.status_var.set("下载过程中出现意外错误：%s" % error)
-        self._log_write("[错误] %s" % error)
+        self._log_line("[错误] %s" % error)
         self._refresh_start_button()
 
     def run(self):

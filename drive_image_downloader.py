@@ -22,6 +22,7 @@ import json
 import os
 import random
 import re
+import socket
 import sys
 import threading
 import time
@@ -215,14 +216,23 @@ def check_yt_dlp():
 
 
 def download_facebook_video(url, dest_base, progress_cb=None, chunk_unused=None, stop_check=None,
-                            max_bytes=DEFAULT_MAX_BYTES):
+                            max_bytes=DEFAULT_MAX_BYTES, log_cb=None):
     _validate_max_bytes(max_bytes)
+
+    def log(message):
+        if log_cb:
+            try:
+                log_cb(message)
+            except Exception:
+                pass
+
     if not is_facebook_url(url):
         return False, "无效的 Facebook HTTPS 链接"
     if not check_yt_dlp():
         return False, "Facebook 下载依赖缺失或版本过旧，请安装 requirements-facebook.txt 中的依赖"
     import yt_dlp
     limit_reached = False
+    progress_state = {"last": 0.0, "bytes": 0, "started": False}
 
     class _SafeLogger:
         # yt-dlp 在抛出异常前也会记录原文；其中可能有签名 URL、请求头或凭据。
@@ -247,9 +257,20 @@ def download_facebook_video(url, dest_base, progress_cb=None, chunk_unused=None,
         if max_bytes and downloaded > max_bytes:
             limit_reached = True
             raise _DownloadLimitExceeded()
+        size = d.get("total_bytes") or d.get("total_bytes_estimate")
+        if d.get("status") in {"downloading", "finished"}:
+            now = time.monotonic()
+            if not progress_state["started"]:
+                progress_state["started"] = True
+                progress_state["last"] = now
+                log("开始下载视频，大小 %s" % _fmt_size(size))
+            elif now - progress_state["last"] >= 5:
+                log("已下载 %s%s，速度 %s/s" % (
+                    _fmt_size(downloaded), (" / " + _fmt_size(size)) if size else "",
+                    _fmt_size((downloaded - progress_state["bytes"]) / (now - progress_state["last"]))))
+                progress_state["last"], progress_state["bytes"] = now, downloaded
         if progress_cb and d.get("status") in {"downloading", "finished"}:
-            progress_cb(downloaded,
-                        d.get("total_bytes") or d.get("total_bytes_estimate"))
+            progress_cb(downloaded, size)
 
     # 私有随机目录隔离下载、分片和清理，避免匹配或删除用户文件。
     try:
@@ -263,7 +284,10 @@ def download_facebook_video(url, dest_base, progress_cb=None, chunk_unused=None,
                 "allowed_extractors": ["facebook.*"],
                 "cachedir": False,
                 "max_filesize": max_bytes or None,
+                # 避免网络不通时长时间无反应
+                "socket_timeout": _NET_TIMEOUT, "retries": 3, "extractor_retries": 2,
             }
+            log("正在解析 Facebook 链接…")
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url.strip(), download=True)
             if limit_reached:
@@ -286,12 +310,13 @@ def download_facebook_video(url, dest_base, progress_cb=None, chunk_unused=None,
                 return False, _LIMIT_MESSAGE
             final = _publish_download(src, dest_base + os.path.splitext(src)[1].lower())
             return True, final
-    except Exception:
+    except Exception as error:
         if limit_reached:
             return False, _LIMIT_MESSAGE
         if stop_check and stop_check():
             return False, "已停止"
-        # 提取器异常可能含带签名 URL、请求头或凭据，不直接回显。
+        # 提取器异常可能含带签名 URL、请求头或凭据，不直接回显；只记录异常类型名。
+        log("Facebook 下载失败（异常类型：%s）" % type(error).__name__)
         return False, "Facebook 下载失败：请检查链接、公开访问权限及网络连接"
 
 
@@ -316,6 +341,37 @@ def _get_ext_from_response(resp, file_id):
     if ctype in CONTENT_TYPE_TO_EXT:
         return CONTENT_TYPE_TO_EXT[ctype]
     return ".bin"  # 未知类型保存为非可执行扩展名，不改变内容
+
+
+_NET_TIMEOUT = 30  # 连接或两次收到数据之间的最长等待秒数
+
+
+def _fmt_size(n):
+    if n is None:
+        return "未知"
+    n = float(n)
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return ("%d %s" % (n, unit)) if unit == "B" else ("%.1f %s" % (n, unit))
+        n /= 1024.0
+
+
+def _is_timeout(error):
+    reason = getattr(error, "reason", None)
+    return (isinstance(error, (socket.timeout, TimeoutError))
+            or isinstance(reason, (socket.timeout, TimeoutError))
+            or "timed out" in str(error).lower())
+
+
+def _describe_network_error(error):
+    """把网络异常翻译成用户能看懂的一句话（不含网址）。"""
+    if error is None:
+        return "未知原因"
+    if _is_timeout(error):
+        return "%d 秒内没有收到谷歌的响应，请检查网络；在无法直接访问谷歌的地区需要开启代理" % _NET_TIMEOUT
+    reason = getattr(error, "reason", None)
+    text = str(reason if reason is not None else error).strip().replace("\n", " ")
+    return "%s：%s" % (type(error).__name__, text[:120]) if text else type(error).__name__
 
 
 def _classify_drive_text(text):
@@ -362,9 +418,10 @@ def _verdict_for_http_error(error):
 
 
 def download_file(file_id, dest_path, progress_cb=None, chunk=65536, stop_check=None,
-                  infer_extension=False, max_bytes=DEFAULT_MAX_BYTES, svg_confirm=None):
+                  infer_extension=False, max_bytes=DEFAULT_MAX_BYTES, svg_confirm=None,
+                  log_cb=None):
     """
-    下载单个 Drive 文件到 dest_path。
+    下载单个 Drive 文件到 dest_path。log_cb(文字) 用于实时报告当前在做什么。
     progress_cb(downloaded_bytes, total_bytes) 会被反复调用（total 可能为 None）。
     stop_check() 返回 True 时立即中断并删除未下完的文件。
     infer_extension=True 时，按实际下载响应确定扩展名，未知类型使用 .bin。
@@ -379,48 +436,66 @@ def download_file(file_id, dest_path, progress_cb=None, chunk=65536, stop_check=
         "https://drive.google.com/uc?export=download&id=%s&confirm=t" % qid,
     ]
 
+    def log(message):
+        if log_cb:
+            try:
+                log_cb(message)
+            except Exception:
+                pass
+
     def open_url(url):
-        return _open_drive_url(url, timeout=60)
+        return _open_drive_url(url, timeout=_NET_TIMEOUT)
 
     tmp_path = None
     temp_dir = None
     resp = None
     last_err = None
-    for url in urls:
+    for number, url in enumerate(urls, 1):
+        started = time.monotonic()
+        log("正在连接谷歌（地址 %d/%d）…" % (number, len(urls)))
         try:
             resp = open_url(url)
+            log("已连接（用时 %.1f 秒）" % (time.monotonic() - started))
             break  # 拿到响应（文件流或确认页），交给下面处理
         except urllib.error.HTTPError as e:
             last_err = e
+            log("地址 %d 返回 HTTP %s（用时 %.1f 秒）" % (number, e.code, time.monotonic() - started))
             verdict = _verdict_for_http_error(e)
             if verdict:
                 return False, verdict
             resp = None
         except Exception as e:
             last_err = e
+            log("地址 %d 连接失败：%s（用时 %.1f 秒）"
+                % (number, _describe_network_error(e), time.monotonic() - started))
             resp = None
     if resp is None:
         if isinstance(last_err, urllib.error.HTTPError):
             return False, ("谷歌拒绝了访问（HTTP %d），可能是权限或临时限制"
                            % last_err.code)
-        return False, "网络错误：无法连接 Google Drive"
+        return False, "网络错误：无法连接 Google Drive（%s）" % _describe_network_error(last_err)
 
     try:
         ctype = (resp.headers.get("Content-Type", "") or "").split(";")[0].strip().lower()
         # 大文件会返回一个确认页面（text/html），需要带 confirm 参数再请求一次
         if ctype == "text/html":
+            log("收到的是网页而不是文件，正在分析原因…")
             html = resp.read(2 * 1024 * 1024).decode("utf-8", "ignore")
             m = re.search(r"confirm=([0-9A-Za-z_=-]+)", html)
             if not m:
-                return False, _classify_drive_text(html) or _UNKNOWN_PAGE_MESSAGE
+                verdict = _classify_drive_text(html) or _UNKNOWN_PAGE_MESSAGE
+                log("判断结果：" + verdict)
+                return False, verdict
             confirm = m.group(1)
+            log("谷歌要求确认（大文件或病毒扫描提示），正在发送确认请求…")
             url2 = ("https://drive.google.com/uc?export=download&id=" + qid
                     + "&confirm=" + urllib.parse.quote(confirm))
             try:
                 resp.close()
                 resp = open_url(url2)
             except Exception as e:
-                return False, "网络错误：无法连接 Google Drive"
+                log("确认请求失败：" + _describe_network_error(e))
+                return False, "网络错误：无法连接 Google Drive（%s）" % _describe_network_error(e)
             ctype = (resp.headers.get("Content-Type", "") or "").split(";")[0].strip().lower()
             if ctype == "text/html":
                 try:
@@ -438,9 +513,12 @@ def download_file(file_id, dest_path, progress_cb=None, chunk=65536, stop_check=
             dest_path = os.path.splitext(dest_path)[0] + response_ext
         total = resp.headers.get("Content-Length")
         total = int(total) if total and total.isdigit() else None
+        log("开始接收文件：类型 %s，大小 %s" % (ctype or "未知", _fmt_size(total)))
         if max_bytes and total is not None and total > max_bytes:
             return False, _LIMIT_MESSAGE
         downloaded = 0
+        began = last_log = time.monotonic()
+        last_bytes = 0
         # 私有目录阻止其他账号查看内部随机文件名；同 UID 或恶意父目录
         # 仍不属于完整防御边界，发布后的文件也受保存目录权限约束。
         temp_dir = tempfile.mkdtemp(prefix=".drive-", dir=os.path.dirname(
@@ -462,6 +540,13 @@ def download_file(file_id, dest_path, progress_cb=None, chunk=65536, stop_check=
                     downloaded += len(data)
                     if progress_cb:
                         progress_cb(downloaded, total)
+                    now = time.monotonic()
+                    if now - last_log >= 5:
+                        log("已下载 %s%s，速度 %s/s" % (
+                            _fmt_size(downloaded),
+                            (" / " + _fmt_size(total)) if total else "",
+                            _fmt_size((downloaded - last_bytes) / (now - last_log))))
+                        last_log, last_bytes = now, downloaded
         finally:
             try:
                 resp.close()
@@ -487,8 +572,11 @@ def download_file(file_id, dest_path, progress_cb=None, chunk=65536, stop_check=
             pass
         # 保留简短、可操作的错误原因，避免所有失败都显示同一条模糊提示。
         detail = str(e).strip().replace("\r", " ").replace("\n", " ")
+        if _is_timeout(e):
+            detail = "下载中断：%d 秒内没有收到数据，请检查网络后点击“继续下载”重试" % _NET_TIMEOUT
         if len(detail) > 240:
             detail = detail[:237] + "..."
+        log("下载失败：" + (detail or type(e).__name__))
         return False, ("下载失败：" + detail if detail else
                        "下载失败：请检查网络、磁盘空间与文件夹权限")
     finally:
@@ -539,7 +627,27 @@ def _group_links(lines):
     return [g for g in groups if g]
 
 
-def build_plan(links, start_number, prefix="", zero_pad=0):
+_START_RE = re.compile(r"^\s*(-?\d+)\s*(?:[-－–—]\s*(\d+))?\s*$")
+
+
+def parse_start(text):
+    """
+    解析“起始序号”：
+      "3" / "03"   -> (3, None)   从第 3 个序号开始
+      "03-2"       -> (3, 2)      从 03 系列的第 2 个文件开始（接着上次没下完的系列）
+    格式不对时抛出 ValueError。
+    """
+    m = _START_RE.match(text or "")
+    if not m:
+        raise ValueError("起始序号格式不对")
+    number = int(m.group(1))
+    sub = int(m.group(2)) if m.group(2) is not None else None
+    if sub is not None and sub < 1:
+        raise ValueError("系列内的序号必须从 1 开始")
+    return number, sub
+
+
+def build_plan(links, start_number, prefix="", zero_pad=0, start_sub=None):
     """
     解析链接并分配文件名，不做任何网络访问。
     返回 dict：
@@ -550,6 +658,9 @@ def build_plan(links, start_number, prefix="", zero_pad=0):
     """
     if isinstance(start_number, bool) or not isinstance(start_number, int):
         raise ValueError("起始序号必须是整数")
+    if start_sub is not None and (isinstance(start_sub, bool)
+                                  or not isinstance(start_sub, int) or start_sub < 1):
+        raise ValueError("系列内的起始序号必须是大于 0 的整数")
     _validate_prefix(prefix)
     groups = _group_links(links)
     entries, items, skipped, titles = [], [], [], []
@@ -564,20 +675,27 @@ def build_plan(links, start_number, prefix="", zero_pad=0):
                 fid = extract_file_id(link)
                 parsed.append((link, "drive", fid) if fid else (link, None, None))
         num = "—"
+        sub_start = None  # 只有第一个有效系列才会从指定的“系列内序号”开始
         if any(kind for _, kind, _ in parsed):
             rank += 1  # 只有含有效链接的系列才占用序号
+            if rank == 0:
+                sub_start = start_sub
             num = str(start_number + rank)
             if zero_pad and zero_pad > 0:
                 num = num.zfill(zero_pad)
         titles.append(num)
         for pos, (link, kind, fid) in enumerate(parsed, 1):
-            tag = num
-            if size > 1:  # 系列：01-1、01-2 …（10 个以上时子序号补零以便排序）
+            tag, suffix = num, False
+            if sub_start is not None:  # 接着已有系列：03-2、03-3 …（即使只有一个文件）
+                tag += "-" + str(sub_start + pos - 1).zfill(len(str(sub_start + size - 1)))
+                suffix = True
+            elif size > 1:  # 系列：01-1、01-2 …（10 个以上时子序号补零以便排序）
                 tag += "-" + str(pos).zfill(len(str(size)))
+                suffix = True
             entry = {"index": len(entries), "group": gi, "pos": pos, "size": size,
                      "link": link, "kind": kind, "fid": fid, "tag": tag,
-                     "valid": kind is not None,
-                     "label": tag if size > 1 else start_number + rank,
+                     "valid": kind is not None, "suffix": suffix,
+                     "label": tag if suffix else start_number + rank,
                      "base_name": ("%s_%s" % (prefix, tag)) if prefix else tag}
             entries.append(entry)
             if kind is None:
@@ -622,7 +740,7 @@ def _pause(seconds, stop_flag):
 
 def run_plan(items, out_dir, status_cb=None, file_progress_cb=None,
              overall_progress_cb=None, stop_flag=None, max_bytes=DEFAULT_MAX_BYTES,
-             svg_confirm=None, delay=0, result_cb=None, cache=None):
+             svg_confirm=None, delay=0, result_cb=None, cache=None, log_cb=None):
     """
     按计划下载 items（build_plan 得到的可下载行）。
     - 同一链接在一次任务里只向服务器请求一次，其余编号直接复制。
@@ -637,6 +755,13 @@ def run_plan(items, out_dir, status_cb=None, file_progress_cb=None,
     results = []
     total = len(items)
     ok_count = 0
+    def log(message):
+        if log_cb:
+            try:
+                log_cb(message)
+            except Exception:
+                pass
+
     done = cache if cache is not None else {}  # 链接键 -> 已下载文件路径
     failed = {}  # 链接键 -> 单文件级失败原因（重复链接不再重复请求）
     for i, item in enumerate(items):
@@ -653,6 +778,9 @@ def run_plan(items, out_dir, status_cb=None, file_progress_cb=None,
 
         key = _item_key(item)
         real_request = False
+        began_at = time.monotonic()
+        log("开始 序号 %s（%s）" % (item["base_name"], "Facebook" if kind == "facebook"
+                                    else "Drive …/d/%s…" % (fid or "")[:10]))
         if key in failed:
             success, info = False, failed[key]
         elif key in done and os.path.exists(done[key]):
@@ -665,16 +793,17 @@ def run_plan(items, out_dir, status_cb=None, file_progress_cb=None,
             dest = os.path.join(out_dir, item["base_name"] + ".bin")
             success, info = download_file(fid, dest, progress_cb=_cb, stop_check=stop_flag,
                                           infer_extension=True, max_bytes=max_bytes,
-                                          svg_confirm=svg_confirm)
+                                          svg_confirm=svg_confirm, log_cb=log_cb)
         else:  # facebook：已在隔离下载目录完成原子发布
             real_request = True
             success, info = download_facebook_video(
                 link, os.path.join(out_dir, item["base_name"]), progress_cb=_cb,
-                stop_check=stop_flag, max_bytes=max_bytes)
+                stop_check=stop_flag, max_bytes=max_bytes, log_cb=log_cb)
 
         if info == "已停止":
             results.append((label, link, "已停止"))
             break
+        log("序号 %s 结束，用时 %.1f 秒" % (item["base_name"], time.monotonic() - began_at))
         if success:
             ok_count += 1
             if real_request:
@@ -698,27 +827,30 @@ def run_plan(items, out_dir, status_cb=None, file_progress_cb=None,
         if real_request and delay and i + 1 < total:
             nxt = _item_key(items[i + 1])
             if nxt not in done and nxt not in failed:
-                _pause(random.uniform(delay * 0.7, delay * 1.3), stop_flag)
+                wait = random.uniform(delay * 0.7, delay * 1.3)
+                log("等待 %.1f 秒后继续（避免请求过于频繁）" % wait)
+                _pause(wait, stop_flag)
     return ok_count, results
 
 
 def download_batch(links, start_number, out_dir, prefix="", zero_pad=0,
                    status_cb=None, file_progress_cb=None, overall_progress_cb=None,
                    stop_flag=None, max_bytes=DEFAULT_MAX_BYTES, svg_confirm=None,
-                   delay=0, result_cb=None):
+                   delay=0, result_cb=None, start_sub=None, log_cb=None):
     """
     批量下载（支持 Google Drive 链接和 Facebook Reels 链接混排）。
+    start_sub 不为 None 时，第一个系列从“系列内第 start_sub 个”开始命名（如 03-2）。
     start_number 必须为整数；不能把外部文本直接用作文件名序号。
     用引号包起来的多行链接是一个“系列”：共用一个序号，命名为 01-1、01-2 …；
     没有引号的单行（或只含一个链接的系列）仍为 01。
     返回 (成功数, [(序号, 原始链接, 结果信息), ...])。
     """
-    plan = build_plan(links, start_number, prefix, zero_pad)
+    plan = build_plan(links, start_number, prefix, zero_pad, start_sub)
     ok_count, results = run_plan(
         plan["items"], out_dir, status_cb=status_cb,
         file_progress_cb=file_progress_cb, overall_progress_cb=overall_progress_cb,
         stop_flag=stop_flag, max_bytes=max_bytes, svg_confirm=svg_confirm,
-        delay=delay, result_cb=result_cb)
+        delay=delay, result_cb=result_cb, log_cb=log_cb)
     return ok_count, list(plan["skipped"]) + results
 
 
