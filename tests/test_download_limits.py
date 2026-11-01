@@ -28,8 +28,8 @@ class DownloadLimitTests(unittest.TestCase):
         self.assertEqual(result, (False, app._LIMIT_MESSAGE))
         self.assertEqual(list(output.iterdir()), [])
 
-    def test_default_is_two_gib_and_known_length_rejected_before_read(self):
-        self.assertEqual(app.DEFAULT_MAX_BYTES, 2 * 1024 ** 3)
+    def test_default_is_ten_gib_and_known_length_rejected_before_read(self):
+        self.assertEqual(app.DEFAULT_MAX_BYTES, 10 * 1024 ** 3)
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)
             response = Response(length=app.DEFAULT_MAX_BYTES + 1)

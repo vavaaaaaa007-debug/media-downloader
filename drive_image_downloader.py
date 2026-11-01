@@ -18,10 +18,13 @@
 使用方法：双击运行本文件，或在命令行执行  python drive_image_downloader.py
 """
 
+import json
 import os
+import random
 import re
 import sys
 import threading
+import time
 import tempfile
 import errno
 import shutil
@@ -33,9 +36,18 @@ import urllib.error
 from email.message import Message
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36"
-DEFAULT_MAX_BYTES = 2 * 1024 ** 3
+DEFAULT_MAX_BYTES = 10 * 1024 ** 3
 _LIMIT_MESSAGE = "文件大小超过单文件下载上限"
 _SVG_CANCEL_MESSAGE = "已取消 SVG 下载：未确认文件来源可信"
+_QUOTA_MESSAGE = "这个文件的下载次数已被谷歌限制（下载人数或次数过多），请过几小时再试"
+_RATE_LIMIT_MESSAGE = "谷歌检测到请求过于频繁，已暂停后面的下载；请等待一段时间后点击“继续下载”"
+_PERMISSION_MESSAGE = "没有访问权限：请确认链接已设置为“知道链接的任何人可查看”"
+_NOTFOUND_MESSAGE = "文件不存在或已被删除"
+_UNKNOWN_PAGE_MESSAGE = ("谷歌返回了无法识别的页面（可能是权限、文件不存在或临时限制），"
+                         "请在浏览器中打开该链接确认")
+_NOT_RUN_MESSAGE = "未下载：因谷歌限流已暂停"
+# 单个文件的失败（换一个文件仍可继续）；限流则对所有文件都有影响。
+_FILE_LEVEL_FAILURES = {_QUOTA_MESSAGE, _PERMISSION_MESSAGE, _NOTFOUND_MESSAGE}
 
 
 class _StopRequested(Exception):
@@ -306,6 +318,49 @@ def _get_ext_from_response(resp, file_id):
     return ".bin"  # 未知类型保存为非可执行扩展名，不改变内容
 
 
+def _classify_drive_text(text):
+    """根据谷歌返回的页面文字判断失败原因；无法确定时返回 None，不乱猜。"""
+    low = text.lower()
+    if (any(k in low for k in ("unusual traffic", "too many requests",
+                               "automated queries"))
+            or any(k in text for k in ("流量异常", "异常流量", "请求过于频繁"))):
+        return _RATE_LIMIT_MESSAGE
+    if (any(k in low for k in ("too many users", "download quota", "quota exceeded",
+                               "quota for this file"))
+            or any(k in text for k in ("用户过多", "下载次数过多", "配额"))):
+        return _QUOTA_MESSAGE
+    if (any(k in low for k in ("does not exist", "not found"))
+            or any(k in text for k in ("不存在", "找不到", "已被删除"))):
+        return _NOTFOUND_MESSAGE
+    if (any(k in low for k in ("you need access", "you need permission",
+                               "request access"))
+            or any(k in text for k in ("需要访问权限", "需要权限", "请求访问权限"))):
+        return _PERMISSION_MESSAGE
+    return None
+
+
+def _verdict_for_http_error(error):
+    """把 HTTP 错误码翻译成明确原因；没有把握时返回 None 以便尝试备用地址。"""
+    code = getattr(error, "code", None)
+    try:
+        if code == 429:
+            return _RATE_LIMIT_MESSAGE
+        if code == 404:
+            return _NOTFOUND_MESSAGE
+        if code == 403:
+            try:
+                body = error.read(256 * 1024).decode("utf-8", "ignore")
+            except Exception:
+                body = ""
+            return _classify_drive_text(body)
+        return None
+    finally:
+        try:
+            error.close()
+        except Exception:
+            pass
+
+
 def download_file(file_id, dest_path, progress_cb=None, chunk=65536, stop_check=None,
                   infer_extension=False, max_bytes=DEFAULT_MAX_BYTES, svg_confirm=None):
     """
@@ -334,15 +389,20 @@ def download_file(file_id, dest_path, progress_cb=None, chunk=65536, stop_check=
     for url in urls:
         try:
             resp = open_url(url)
-            ctype = (resp.headers.get("Content-Type", "") or "").split(";")[0].strip().lower()
-            if ctype != "text/html":
-                break  # 拿到文件流，直接用
-            # 仍是 HTML（旧版确认页），走下面的确认页逻辑
-            break
+            break  # 拿到响应（文件流或确认页），交给下面处理
+        except urllib.error.HTTPError as e:
+            last_err = e
+            verdict = _verdict_for_http_error(e)
+            if verdict:
+                return False, verdict
+            resp = None
         except Exception as e:
             last_err = e
             resp = None
     if resp is None:
+        if isinstance(last_err, urllib.error.HTTPError):
+            return False, ("谷歌拒绝了访问（HTTP %d），可能是权限或临时限制"
+                           % last_err.code)
         return False, "网络错误：无法连接 Google Drive"
 
     try:
@@ -352,14 +412,7 @@ def download_file(file_id, dest_path, progress_cb=None, chunk=65536, stop_check=
             html = resp.read(2 * 1024 * 1024).decode("utf-8", "ignore")
             m = re.search(r"confirm=([0-9A-Za-z_=-]+)", html)
             if not m:
-                low = html.lower()
-                if ("quota" in low or "too many" in low or "try again" in low
-                        or "tente novamente" in low or "很抱歉" in html
-                        or "temporarily unavailable" in low):
-                    return False, ("谷歌暂时限制了下载（下载太频繁或配额用完），"
-                                   "请过几小时再试，不要连续重复下载")
-                return False, ("谷歌返回了确认页面但无法继续，可能是大文件限制或临时限制，"
-                               "请稍后再试")
+                return False, _classify_drive_text(html) or _UNKNOWN_PAGE_MESSAGE
             confirm = m.group(1)
             url2 = ("https://drive.google.com/uc?export=download&id=" + qid
                     + "&confirm=" + urllib.parse.quote(confirm))
@@ -370,7 +423,12 @@ def download_file(file_id, dest_path, progress_cb=None, chunk=65536, stop_check=
                 return False, "网络错误：无法连接 Google Drive"
             ctype = (resp.headers.get("Content-Type", "") or "").split(";")[0].strip().lower()
             if ctype == "text/html":
-                return False, "仍被要求确认，可能是大文件或权限问题"
+                try:
+                    body = resp.read(1024 * 1024).decode("utf-8", "ignore")
+                except Exception:
+                    body = ""
+                return False, (_classify_drive_text(body)
+                               or "仍被要求确认，可能是大文件或权限问题")
 
         response_ext = _get_ext_from_response(resp, file_id)
         if ((ctype == "image/svg+xml" or response_ext == ".svg")
@@ -447,85 +505,220 @@ def download_file(file_id, dest_path, progress_cb=None, chunk=65536, stop_check=
                 pass
 
 
-def download_batch(links, start_number, out_dir, prefix="", zero_pad=0,
-                   status_cb=None, file_progress_cb=None, overall_progress_cb=None,
-                   stop_flag=None, max_bytes=DEFAULT_MAX_BYTES, svg_confirm=None):
+_QUOTES = ('"', "\u201c", "\u201d")
+
+
+def _group_links(lines):
+    """把文本行分成“系列”。表格里一格含多个链接时，复制出来被引号整体包住：
+    引号包住的多行是一个系列，没有引号的单行是单个文件。空行忽略。"""
+    groups, current = [], None
+    for raw in lines:
+        link = raw.strip()
+        if len(link) == 1 and link in _QUOTES:  # 单独一个引号：开始或结束
+            if current is None:
+                current = []
+                groups.append(current)
+            else:
+                current = None
+            continue
+        if link[:1] in _QUOTES:
+            link = link[1:]
+            current = []
+            groups.append(current)
+        ends = link[-1:] in _QUOTES
+        if ends:
+            link = link[:-1]
+        link = link.strip()
+        if link:
+            if current is None:
+                groups.append([link])
+            else:
+                current.append(link)
+        if ends:
+            current = None
+    return [g for g in groups if g]
+
+
+def build_plan(links, start_number, prefix="", zero_pad=0):
     """
-    批量下载（支持 Google Drive 链接和 Facebook Reels 链接混排）。
-    start_number 必须为整数；不能把外部文本直接用作文件名序号。
-    返回 (成功数, [(序号, 原始链接, 结果信息), ...])。
+    解析链接并分配文件名，不做任何网络访问。
+    返回 dict：
+      entries      按粘贴顺序的每一行（含无法识别的），供界面预览
+      items        其中可下载的行（entries 里 valid=True 的同一批 dict）
+      group_titles 每个系列的主序号文字（如 "01"）
+      skipped      无法识别的链接 [(None, 链接, "无法识别的链接"), ...]
     """
     if isinstance(start_number, bool) or not isinstance(start_number, int):
         raise ValueError("起始序号必须是整数")
     _validate_prefix(prefix)
+    groups = _group_links(links)
+    entries, items, skipped, titles = [], [], [], []
+    rank = -1
+    for gi, group in enumerate(groups):
+        size = len(group)
+        parsed = []
+        for link in group:
+            if is_facebook_url(link):
+                parsed.append((link, "facebook", None))
+            else:
+                fid = extract_file_id(link)
+                parsed.append((link, "drive", fid) if fid else (link, None, None))
+        num = "—"
+        if any(kind for _, kind, _ in parsed):
+            rank += 1  # 只有含有效链接的系列才占用序号
+            num = str(start_number + rank)
+            if zero_pad and zero_pad > 0:
+                num = num.zfill(zero_pad)
+        titles.append(num)
+        for pos, (link, kind, fid) in enumerate(parsed, 1):
+            tag = num
+            if size > 1:  # 系列：01-1、01-2 …（10 个以上时子序号补零以便排序）
+                tag += "-" + str(pos).zfill(len(str(size)))
+            entry = {"index": len(entries), "group": gi, "pos": pos, "size": size,
+                     "link": link, "kind": kind, "fid": fid, "tag": tag,
+                     "valid": kind is not None,
+                     "label": tag if size > 1 else start_number + rank,
+                     "base_name": ("%s_%s" % (prefix, tag)) if prefix else tag}
+            entries.append(entry)
+            if kind is None:
+                skipped.append((None, link, "无法识别的链接"))
+            else:
+                items.append(entry)
+    return {"entries": entries, "items": items,
+            "group_titles": titles, "skipped": skipped}
+
+
+def _item_key(item):
+    return (item["kind"], item["fid"] if item["kind"] == "drive" else item["link"])
+
+
+def _copy_download(src, dest):
+    """把已下载好的文件复制成新编号（同一链接只向谷歌请求一次）。"""
+    temp_dir = None
+    try:
+        temp_dir = tempfile.mkdtemp(prefix=".drive-", dir=os.path.dirname(
+            os.path.abspath(dest)))
+        tmp = os.path.join(temp_dir, "media-copy")
+        shutil.copyfile(src, tmp)
+        return True, _publish_download(tmp, dest)
+    except Exception as e:
+        return False, "复制失败：" + str(e).strip()[:200]
+    finally:
+        if temp_dir is not None:
+            try:
+                shutil.rmtree(temp_dir)
+            except OSError:
+                pass
+
+
+def _pause(seconds, stop_flag):
+    """可被“停止”打断的等待。"""
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        if stop_flag and stop_flag():
+            return
+        time.sleep(min(0.1, max(0.0, end - time.monotonic())))
+
+
+def run_plan(items, out_dir, status_cb=None, file_progress_cb=None,
+             overall_progress_cb=None, stop_flag=None, max_bytes=DEFAULT_MAX_BYTES,
+             svg_confirm=None, delay=0, result_cb=None):
+    """
+    按计划下载 items（build_plan 得到的可下载行）。
+    - 同一链接在一次任务里只向服务器请求一次，其余编号直接复制。
+    - 遇到谷歌限流（请求过于频繁）立即暂停，后面的标记为“未下载”，便于稍后继续。
+    - delay>0 时，两次真实下载之间随机等待约 delay 秒，减少触发限流。
+    - result_cb(item, 是否成功, 文件路径或失败原因) 在每个文件结束时调用。
+    返回 (成功数, [(序号, 原始链接, 结果信息), ...])。
+    """
     _validate_max_bytes(max_bytes)
     out_dir = os.path.abspath(out_dir)
     results = []
-    items = []  # (link, kind, file_id)
-    for link in links:
-        link = link.strip()
-        if not link:
-            continue
-        # 注意：重复的链接不跳过，每一行都会下载并占用一个序号
-        if is_facebook_url(link):
-            items.append((link, "facebook", None))
-            continue
-        fid = extract_file_id(link)
-        if fid:
-            items.append((link, "drive", fid))
-        else:
-            results.append((None, link, "无法识别的链接"))
-
     total = len(items)
     ok_count = 0
-    n = start_number
-    for i, (link, kind, fid) in enumerate(items):
+    done = {}    # 链接键 -> 已下载文件路径
+    failed = {}  # 链接键 -> 单文件级失败原因（重复链接不再重复请求）
+    for i, item in enumerate(items):
+        link, kind, fid, label = item["link"], item["kind"], item["fid"], item["label"]
         if stop_flag and stop_flag():
             results.append((None, link, "已停止"))
             break
         if status_cb:
             status_cb("正在下载第 %d/%d 个 ..." % (i + 1, total))
 
-        num_str = str(n)
-        if zero_pad and zero_pad > 0:
-            num_str = num_str.zfill(zero_pad)
-        base_name = ("%s_%s" % (prefix, num_str)) if prefix else num_str
-
         def _cb(d, t, _i=i, _t=total):
             if file_progress_cb:
                 file_progress_cb(_i, _t, d, t)
 
-        if kind == "drive":
+        key = _item_key(item)
+        real_request = False
+        if key in failed:
+            success, info = False, failed[key]
+        elif key in done and os.path.exists(done[key]):
+            ext = os.path.splitext(done[key])[1]
+            success, info = _copy_download(
+                done[key], os.path.join(out_dir, item["base_name"] + ext))
+        elif kind == "drive":
+            real_request = True
             # 后缀和正文取自同一次最终响应，避免探测失败或两次响应变化时误标。
-            dest = os.path.join(out_dir, base_name + ".bin")
+            dest = os.path.join(out_dir, item["base_name"] + ".bin")
             success, info = download_file(fid, dest, progress_cb=_cb, stop_check=stop_flag,
                                           infer_extension=True, max_bytes=max_bytes,
                                           svg_confirm=svg_confirm)
-        else:  # facebook
-            tmp_base = os.path.join(out_dir, base_name)
-            success, info = download_facebook_video(link, tmp_base, progress_cb=_cb,
-                                                    stop_check=stop_flag, max_bytes=max_bytes)
+        else:  # facebook：已在隔离下载目录完成原子发布
+            real_request = True
+            success, info = download_facebook_video(
+                link, os.path.join(out_dir, item["base_name"]), progress_cb=_cb,
+                stop_check=stop_flag, max_bytes=max_bytes)
 
         if info == "已停止":
-            results.append((n, link, "已停止"))
+            results.append((label, link, "已停止"))
             break
-
-        if kind == "drive":
-            if success:
-                ok_count += 1
-                results.append((n, link, os.path.basename(info)))
-            else:
-                results.append((n, link, "失败: " + info))
-        else:  # facebook：已在隔离下载目录完成原子发布
-            if success:
-                ok_count += 1
-                results.append((n, link, os.path.basename(info)))
-            else:
-                results.append((n, link, "失败: " + info))
+        if success:
+            ok_count += 1
+            if real_request:
+                done[key] = info
+            results.append((label, link, os.path.basename(info)))
+        else:
+            if info in _FILE_LEVEL_FAILURES:
+                failed[key] = info
+            results.append((label, link, "失败: " + info))
+        if result_cb:
+            result_cb(item, success, info)
         if overall_progress_cb:
             overall_progress_cb(i + 1, total)
-        n += 1
+
+        if not success and info == _RATE_LIMIT_MESSAGE:
+            for rest in items[i + 1:]:
+                results.append((rest["label"], rest["link"], _NOT_RUN_MESSAGE))
+                if result_cb:
+                    result_cb(rest, False, _NOT_RUN_MESSAGE)
+            break
+        if real_request and delay and i + 1 < total:
+            nxt = _item_key(items[i + 1])
+            if nxt not in done and nxt not in failed:
+                _pause(random.uniform(delay * 0.7, delay * 1.3), stop_flag)
     return ok_count, results
+
+
+def download_batch(links, start_number, out_dir, prefix="", zero_pad=0,
+                   status_cb=None, file_progress_cb=None, overall_progress_cb=None,
+                   stop_flag=None, max_bytes=DEFAULT_MAX_BYTES, svg_confirm=None,
+                   delay=0, result_cb=None):
+    """
+    批量下载（支持 Google Drive 链接和 Facebook Reels 链接混排）。
+    start_number 必须为整数；不能把外部文本直接用作文件名序号。
+    用引号包起来的多行链接是一个“系列”：共用一个序号，命名为 01-1、01-2 …；
+    没有引号的单行（或只含一个链接的系列）仍为 01。
+    返回 (成功数, [(序号, 原始链接, 结果信息), ...])。
+    """
+    plan = build_plan(links, start_number, prefix, zero_pad)
+    ok_count, results = run_plan(
+        plan["items"], out_dir, status_cb=status_cb,
+        file_progress_cb=file_progress_cb, overall_progress_cb=overall_progress_cb,
+        stop_flag=stop_flag, max_bytes=max_bytes, svg_confirm=svg_confirm,
+        delay=delay, result_cb=result_cb)
+    return ok_count, list(plan["skipped"]) + results
 
 
 def _avoid_overwrite(dest):
@@ -560,18 +753,66 @@ def probe_ext(file_id):
     return ".bin"
 
 
+# ---------------------------------------------------------------- 设置
+def _settings_file():
+    if sys.platform.startswith("win"):
+        base = os.environ.get("APPDATA") or os.path.expanduser("~")
+    elif sys.platform == "darwin":
+        base = os.path.expanduser("~/Library/Application Support")
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, "媒体下载器", "settings.json")
+
+
+def load_settings(path=None):
+    try:
+        with open(path or _settings_file(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_settings(updates, path=None):
+    """合并写入设置；失败时不打扰用户，返回 False。"""
+    path = path or _settings_file()
+    try:
+        data = load_settings(path)
+        data.update(updates)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+        return True
+    except OSError:
+        return False
+
+
+def default_out_dir():
+    return os.path.join(os.path.expanduser("~"), "Downloads", "drive_images")
+
+
+def initial_out_dir(path=None):
+    """上一次使用的保存文件夹；不存在时回到默认位置。"""
+    last = load_settings(path).get("out_dir")
+    if isinstance(last, str) and last and os.path.isdir(last):
+        return last
+    return default_out_dir()
+
+
 # ---------------------------------------------------------------- GUI
-def main():
+def main_classic():
     import tkinter as tk
     from tkinter import ttk, filedialog, messagebox, scrolledtext
 
     root = tk.Tk()
     root.title("媒体下载器")
-    root.geometry("640x560")
+    root.geometry("680x580")
     root.minsize(560, 480)
 
     # ---- 链接输入
-    ttk.Label(root, text="1. 粘贴链接（每行一个，按粘贴顺序下载）：\n"
+    ttk.Label(root, text="1. 粘贴链接（每行一个，按粘贴顺序下载；表格里带引号的一组链接自动当作一个系列）：\n"
                          "   • Google Drive 分享链接（图片/视频）\n"
                          "   • Facebook Reels 链接（需安装 yt-dlp，见使用说明）").pack(anchor="w", padx=12, pady=(12, 4))
     txt = scrolledtext.ScrolledText(root, height=9, wrap="none", font=("Consolas", 10))
@@ -592,13 +833,13 @@ def main():
     pad_box.grid(row=0, column=3, sticky="w")
 
     ttk.Label(frm, text="3. 保存文件夹：").grid(row=1, column=0, sticky="w", pady=(10, 0))
-    out_var = tk.StringVar(value=os.path.join(os.path.expanduser("~"), "Downloads", "drive_images"))
+    out_var = tk.StringVar(value=initial_out_dir())
     ttk.Entry(frm, textvariable=out_var, width=52).grid(row=1, column=1, columnspan=2, sticky="we", pady=(10, 0))
     ttk.Button(frm, text="选择…", command=lambda: _choose_dir(out_var)).grid(row=1, column=3, sticky="w", pady=(10, 0))
     frm.columnconfigure(1, weight=1)
 
     ttk.Label(frm, text="单文件上限（GB）：").grid(row=2, column=0, sticky="w", pady=(10, 0))
-    max_size_var = tk.StringVar(value="2")
+    max_size_var = tk.StringVar(value="10")
     ttk.Entry(frm, textvariable=max_size_var, width=8).grid(
         row=2, column=1, sticky="w", pady=(10, 0))
     ttk.Label(frm, text="可调大；填 0 表示不限（1 GB = 1024³ 字节）").grid(
@@ -671,7 +912,8 @@ def main():
 
     def run():
         raw = txt.get("1.0", "end").strip().splitlines()
-        links = [l for l in (x.strip() for x in raw) if l]
+        # 保留引号：引号包住的多行链接是同一个系列。
+        links = [x.strip() for x in raw if x.strip()]
         if not links:
             messagebox.showwarning("提示", "请先粘贴至少一个链接。")
             return
@@ -699,7 +941,7 @@ def main():
                 "Windows 可将 python3 改为 python。")
             return
         # 有 Facebook 链接时，提前检查 yt-dlp
-        if any(is_facebook_url(l) for l in links) and not check_yt_dlp():
+        if any(is_facebook_url(l) for g in _group_links(links) for l in g) and not check_yt_dlp():
             messagebox.showwarning(
                 "需要安装或更新下载依赖",
                 "检测到 Facebook 链接，但下载依赖缺失或版本过旧，无法下载。\n\n"
@@ -714,6 +956,7 @@ def main():
         except Exception as e:
             messagebox.showerror("错误", "无法创建保存文件夹：%s" % e)
             return
+        save_settings({"out_dir": out_dir})
         pad_choice = pad_var.get()
         zero_pad = {"2位（01）": 2, "3位（001）": 3}.get(pad_choice, 0)
 
@@ -745,7 +988,7 @@ def main():
                 status_cb=status_cb, file_progress_cb=file_cb,
                 overall_progress_cb=overall_cb,
                 stop_flag=lambda: stop_requested["v"],
-                max_bytes=max_bytes, svg_confirm=confirm_svg)
+                max_bytes=max_bytes, svg_confirm=confirm_svg, delay=1.5)
             def done():
                 for num, link, info in results:
                     if num is None:
@@ -789,6 +1032,21 @@ def _open_folder(path):
             subprocess.Popen(["xdg-open", os.path.abspath(path)])
     except Exception:
         pass
+
+
+def main():
+    """优先使用新界面；新界面无法启动时自动退回经典界面，保证软件能用。
+    加参数 --classic 可强制使用经典界面。"""
+    if "--classic" in sys.argv[1:]:
+        return main_classic()
+    try:
+        import downloader_ui
+        app = downloader_ui.App(sys.modules[__name__])
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        return main_classic()
+    app.run()
 
 
 if __name__ == "__main__":

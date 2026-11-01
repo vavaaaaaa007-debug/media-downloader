@@ -26,6 +26,7 @@ scripts/
   package_artifact.py
 tests/
 drive_image_downloader.py
+downloader_ui.py
 requirements-runtime.txt
 requirements-facebook.txt
 requirements-build.txt
@@ -74,9 +75,16 @@ Artifacts 下载得到的外层压缩包里有应用 ZIP 和 SHA-256 校验文�
 
 Windows 的单文件构建会在 `build/spec-windows` 生成临时 spec，不覆盖仓库里用于 Mac 的 `媒体下载器.spec`。
 
+## 本次更新：界面与下载
+
+- 新界面（浅紫配色、圆角胶囊）在 `downloader_ui.py`，只用 Python 自带的 tkinter，不增加依赖。若新界面无法启动，会自动退回经典界面；也可用命令行参数 `--classic` 强制使用经典界面。
+- 粘贴表格里带引号的一组链接，会整理成一个格子，命名为 01-1、01-2……；单个链接仍为 01。
+- 同一个链接在一次任务里只向谷歌请求一次，其余编号直接在本地复制；文件之间有短暂间隔；遇到谷歌限流会暂停，点击“继续下载”只补下未完成的文件。
+- 保存文件夹默认使用上一次选择的位置；单文件大小上限默认 10 GB，不再显示在界面上。
+
 ## 验证状态与边界
 
-项目的现有 42 项测试已在本地 macOS 环境通过，选定图标的 macOS 构建也已通过。本次 GitHub 配置在本地完成 YAML 解析、配置检查、图标格式检查，以及 macOS 成品验证/压缩脚本检查。
+项目的回归测试已随本次更新增加（下载失败原因判断、同链接只下载一次、限流暂停、记住保存位置、系列命名、新界面的流程冒烟测试），均不联网。其中新界面的测试使用模拟的界面零件，**尚未在真实 Windows/Mac 桌面上目视检查过**，首次运行后请先看一遍界面再分发。
 
 **仓库尚未创建，因此还没有实际运行过这三个 GitHub 云端任务。** Windows 和 Intel Mac 成品仍须以首次 GitHub 运行结果为准，不将本地 macOS 通过冒充为所有平台已通过。
 
