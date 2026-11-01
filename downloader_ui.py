@@ -9,6 +9,7 @@
 import os
 import sys
 import threading
+import time
 from urllib.parse import urlsplit
 
 try:
@@ -42,6 +43,7 @@ OK = "#2F7D4F"
 ERR = "#B3261E"
 RUN = "#753DE6"
 
+SHORTCUT = "⌘V" if sys.platform == "darwin" else "Ctrl+V"
 PAD_CHOICES = ["不补零", "2位（01）", "3位（001）"]
 PAD_VALUES = {"不补零": 0, "2位（01）": 2, "3位（001）": 3}
 
@@ -346,7 +348,7 @@ class ProgressBar:
 class PasteZone:
     def __init__(self, parent, on_click, font, small_font, bold_font):
         self.fonts = (font, small_font, bold_font)
-        self.canvas = tk.Canvas(parent, height=190, bg=FIELD, highlightthickness=0, bd=0)
+        self.canvas = tk.Canvas(parent, height=210, bg=FIELD, highlightthickness=0, bd=0)
         self.button = PillButton(self.canvas, "从剪贴板粘贴", on_click, style="secondary",
                                  width=136, icon="clipboard", font=font, parent_bg=FIELD)
         self._win = self.canvas.create_window(0, 0, window=self.button.canvas)
@@ -360,7 +362,7 @@ class PasteZone:
         c.create_polygon(rounded_points(2, 2, w - 2, h - 2, 16), smooth=True, fill=FIELD,
                          outline=BORDER_STRONG, dash=(5, 4), tags="zone")
         cx, cy = w / 2.0, h / 2.0
-        top = cy - 52
+        top = cy - 62
         c.create_oval(cx - 22, top - 22, cx + 22, top + 22, fill="#E8DCFC", outline="", tags="zone")
         c.create_rectangle(cx - 8, top - 9, cx + 8, top + 11, outline=ACCENT, width=2, tags="zone")
         c.create_rectangle(cx - 4, top - 12, cx + 4, top - 6, outline=ACCENT, width=2,
@@ -368,7 +370,9 @@ class PasteZone:
         c.create_text(cx, cy + 2, text="把链接粘贴到这里", font=bold, fill=TEXT, tags="zone")
         c.create_text(cx, cy + 24, text="支持 Google Drive 和 Facebook Reels 链接",
                       font=small, fill=TEXT3, tags="zone")
-        c.coords(self._win, cx, cy + 58)
+        c.create_text(cx, cy + 44, text="也可以直接按 %s 粘贴，可以多次粘贴" % SHORTCUT,
+                      font=small, fill=TEXT3, tags="zone")
+        c.coords(self._win, cx, cy + 76)
         c.tag_lower("zone")
 
     def pack(self, **kw):
@@ -566,6 +570,8 @@ class App:
         self.ok_set = set()
         self.running = False
         self.stop_requested = False
+        self.done_cache = {}      # 已下载过的链接，继续下载时不再重复请求
+        self._last_key_paste = 0.0
 
         self._build_header()
         self._build_bottom()
@@ -574,7 +580,8 @@ class App:
 
         self.start_var.trace_add("write", lambda *_: self._on_settings_changed())
         self.pad_var.trace_add("write", lambda *_: self._on_settings_changed())
-        for sequence in ("<Control-v>", "<Control-V>", "<Command-v>", "<Command-V>"):
+        # Mac 上 ⌘V 常以 <<Paste>> 事件送达；其余系统用 Ctrl+V。全部绑定，并在处理里防重复。
+        for sequence in ("<<Paste>>", "<Control-v>", "<Control-V>", "<Command-v>", "<Command-V>"):
             try:
                 root.bind(sequence, self._on_paste_key)
             except tk.TclError:
@@ -648,8 +655,8 @@ class App:
         tk.Label(head, text="1. 粘贴链接", bg=BG, fg=TEXT, font=self.f_bold).pack(side="left")
         tk.Label(head, text="每行一个；同一系列的链接会自动放进同一个格子", bg=BG, fg=TEXT2,
                  font=self.f_small).pack(side="left", padx=(8, 0))
-        self.btn_repaste = PillButton(head, "重新粘贴", self._on_repaste, style="secondary",
-                                      width=84, height=26, font=self.f_small)
+        self.btn_clear = PillButton(head, "清空", self._on_clear, style="secondary",
+                                    width=56, height=26, font=self.f_small)
 
         self.stage = tk.Frame(self.root, bg=BG)
         self.stage.pack(side="top", fill="both", expand=True, padx=pad, pady=(8, 0))
@@ -660,10 +667,11 @@ class App:
     def _show_empty(self):
         self.cards.pack_forget()
         self.zone.pack(fill="both", expand=True)
-        self.btn_repaste.pack_forget()
+        self.btn_clear.pack_forget()
         self.plan = None
         self.raw_lines = None
         self.ok_set = set()
+        self.done_cache = {}
         self.progress.set(0)
         self.status_var.set("就绪")
         self._refresh_start_button()
@@ -671,7 +679,7 @@ class App:
     def _show_cards(self):
         self.zone.pack_forget()
         self.cards.pack(fill="both", expand=True)
-        self.btn_repaste.pack(side="right")
+        self.btn_clear.pack(side="right")
 
     def _refresh_start_button(self):
         if self.running:
@@ -691,41 +699,78 @@ class App:
 
     # ---------------------------------------------------------- 粘贴与识别
     def _on_paste_click(self):
+        if self.running:
+            self.status_var.set("正在下载，下载结束或停止后才能继续粘贴")
+            return
         try:
             text = self.root.clipboard_get()
         except tk.TclError:
             text = ""
         if not text.strip():
-            messagebox.showinfo("提示", "剪贴板里没有文字。请先复制链接，再点击粘贴。")
+            messagebox.showinfo("提示", "剪贴板里没有文字。请先复制链接，再粘贴。")
             return
-        self.load_text(text)
+        self.add_text(text)
 
     def _on_paste_key(self, _event=None):
-        if self.running:
-            return
-        if isinstance(self.root.focus_get(), tk.Entry):
+        try:
+            focus = self.root.focus_get()
+        except Exception:
+            focus = None
+        if isinstance(focus, tk.Entry):
             return  # 在输入框里按粘贴，交给输入框自己处理
+        now = time.monotonic()
+        if now - self._last_key_paste < 0.3:
+            return  # 同一次按键可能同时触发 <<Paste>> 和 Ctrl+V，只处理一次
+        self._last_key_paste = now
         self._on_paste_click()
 
-    def _on_repaste(self):
-        if self.running:
-            return
-        self._show_empty()
+    def _canonical(self, lines):
+        """把一次粘贴的内容整理成引号完全配对的行，避免上一次没闭合的引号吞掉下一次粘贴。"""
+        out = []
+        for group in self.b._group_links(lines):
+            if len(group) == 1:
+                out.append(group[0])
+            else:
+                out.append('"' + group[0])
+                out.extend(group[1:-1])
+                out.append(group[-1] + '"')
+        return out
 
-    def load_text(self, text):
-        """接收粘贴的文字，识别并显示成格子。"""
-        lines = text.splitlines()
-        plan = self._make_plan(lines)
-        if plan is None or not plan["items"]:
+    def add_text(self, text):
+        """接收粘贴的文字：第一次粘贴建立列表，之后的粘贴接在后面，编号继续往下排。"""
+        lines = self._canonical(text.splitlines())
+        combined = (self.raw_lines or []) + lines
+        plan = self._make_plan(combined) if lines else None
+        before = len(self.plan["items"]) if self.plan else 0
+        if plan is None or len(plan["items"]) <= before:
             messagebox.showwarning("提示", "没有识别到可用的链接。请确认复制的是 Google Drive 或 Facebook Reels 链接。")
             return
-        self.raw_lines = lines
-        self.ok_set = set()
-        self._apply_plan(plan)
+        first = self.plan is None
+        added = len(plan["items"]) - before
+        self.raw_lines = combined
+        if first:
+            self.ok_set = set()
+            self.progress.set(0)
+        self._apply_plan(plan, keep_status=not first)
         self._show_cards()
-        self.progress.set(0)
-        self.status_var.set("已识别，点击“开始下载”")
+        if not first:
+            self.cards.canvas.yview_moveto(1.0)
+        self.status_var.set("已添加 %d 个文件，共 %d 个；按 %s 可继续粘贴，或点击“%s”"
+                            % (added, len(plan["items"]), SHORTCUT,
+                               "继续下载" if self.ok_set else "开始下载"))
         self._refresh_start_button()
+
+    load_text = add_text
+
+    def _on_clear(self):
+        if self.running:
+            self.status_var.set("正在下载，请先点“停止”再清空")
+            return
+        pending = self._pending_items()
+        if pending and not messagebox.askyesno(
+                "清空", "要清空已粘贴的内容吗？\n还有 %d 个文件没有下载。" % len(pending)):
+            return
+        self._show_empty()
 
     def _start_value(self):
         try:
@@ -738,9 +783,10 @@ class App:
         return self.b.build_plan(lines, 1 if start is None else start, "",
                                  PAD_VALUES.get(self.pad_var.get(), 0))
 
-    def _apply_plan(self, plan):
+    def _apply_plan(self, plan, keep_status=False):
         self.plan = plan
-        self.cards.reset_status()
+        if not keep_status:
+            self.cards.reset_status()
         series, singles, files = summarize(plan)
         self.cards.set_summary(series, singles, files, len(plan["group_titles"]))
         self.cards.set_entries(plan["entries"], plan["group_titles"])
@@ -752,6 +798,7 @@ class App:
         if plan is None:
             return
         self.ok_set = set()  # 命名规则变了，之前的完成标记不再适用
+        self.done_cache = {}
         self._apply_plan(plan)
         self._refresh_start_button()
 
@@ -879,7 +926,7 @@ class App:
                 items, out_dir, status_cb=on_status, file_progress_cb=on_file_progress,
                 overall_progress_cb=on_overall, stop_flag=lambda: self.stop_requested,
                 max_bytes=self.b.DEFAULT_MAX_BYTES, svg_confirm=confirm_svg, delay=1.5,
-                result_cb=on_result)
+                result_cb=on_result, cache=self.done_cache)
             ui(0, lambda: self._finish(count, total, out_dir, results))
         except Exception as e:  # 防止后台线程异常导致界面一直停在“下载中”
             ui(0, lambda: self._crash(e))

@@ -622,13 +622,14 @@ def _pause(seconds, stop_flag):
 
 def run_plan(items, out_dir, status_cb=None, file_progress_cb=None,
              overall_progress_cb=None, stop_flag=None, max_bytes=DEFAULT_MAX_BYTES,
-             svg_confirm=None, delay=0, result_cb=None):
+             svg_confirm=None, delay=0, result_cb=None, cache=None):
     """
     按计划下载 items（build_plan 得到的可下载行）。
     - 同一链接在一次任务里只向服务器请求一次，其余编号直接复制。
     - 遇到谷歌限流（请求过于频繁）立即暂停，后面的标记为“未下载”，便于稍后继续。
     - delay>0 时，两次真实下载之间随机等待约 delay 秒，减少触发限流。
     - result_cb(item, 是否成功, 文件路径或失败原因) 在每个文件结束时调用。
+    - cache：可选的字典，在多次调用（如“继续下载”）之间共用，已下载过的链接不会重复请求。
     返回 (成功数, [(序号, 原始链接, 结果信息), ...])。
     """
     _validate_max_bytes(max_bytes)
@@ -636,7 +637,7 @@ def run_plan(items, out_dir, status_cb=None, file_progress_cb=None,
     results = []
     total = len(items)
     ok_count = 0
-    done = {}    # 链接键 -> 已下载文件路径
+    done = cache if cache is not None else {}  # 链接键 -> 已下载文件路径
     failed = {}  # 链接键 -> 单文件级失败原因（重复链接不再重复请求）
     for i, item in enumerate(items):
         link, kind, fid, label = item["link"], item["kind"], item["fid"], item["label"]

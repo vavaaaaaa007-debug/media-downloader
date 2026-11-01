@@ -92,6 +92,24 @@ class BatchReliabilityTests(unittest.TestCase):
                              ["01-1.jpg", "01-2.jpg", "02-1.jpg", "02-2.jpg", "03.jpg"])
             self.assertEqual((Path(d) / "02-1.jpg").read_bytes(), b"data-" + b"a" * 12)
 
+    def test_cache_shared_between_runs_avoids_repeat_requests(self):
+        cache, calls = {}, []
+
+        def fake(fid, dest, **kw):
+            calls.append(fid)
+            final = dest[:-4] + ".jpg"
+            Path(final).write_bytes(b"x")
+            return True, final
+
+        with tempfile.TemporaryDirectory() as d, patch.object(app, "download_file", side_effect=fake):
+            first = app.build_plan([A], 1, zero_pad=2)["items"]
+            second = app.build_plan([A, A], 2, zero_pad=2)["items"]
+            app.run_plan(first, d, cache=cache)
+            app.run_plan(second, d, cache=cache)
+            names = sorted(p.name for p in Path(d).iterdir())
+        self.assertEqual(calls, ["a" * 12])
+        self.assertEqual(names, ["01.jpg", "02.jpg", "03.jpg"])
+
     def test_rate_limit_stops_batch_and_marks_rest_not_run(self):
         seen, cb = [], []
         with tempfile.TemporaryDirectory() as d, patch.object(

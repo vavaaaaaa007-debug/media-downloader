@@ -215,11 +215,85 @@ class UiSmokeTests(unittest.TestCase):
         self.assertIsNone(self.app.plan)
         self.assertEqual(self.box.calls[-1][0], "showwarning")
 
-    def test_repaste_returns_to_empty_state(self):
+    def test_clear_returns_to_empty_state_and_confirms_when_unfinished(self):
         self.app._on_paste_click()
-        self.app._on_repaste()
+        self.app._on_clear()
+        self.assertEqual(self.box.calls[-1][0], "askyesno")
         self.assertIsNone(self.app.plan)
         self.assertEqual(self.app.btn_start.style, "primary_off")
+        self.assertEqual(self.app.done_cache, {})
+
+    def test_clear_does_not_ask_when_everything_is_downloaded(self):
+        self.app._on_paste_click()
+        with patch.object(backend, "download_file", side_effect=self.fake_download()):
+            self.app._on_start()
+        self.box.calls.clear()
+        self.app._on_clear()
+        self.assertEqual(self.box.calls, [])
+        self.assertIsNone(self.app.plan)
+
+    def test_clear_declined_keeps_list(self):
+        self.app._on_paste_click()
+        self.box.askyesno = lambda *a, **k: False
+        self.app._on_clear()
+        self.assertIsNotNone(self.app.plan)
+
+    def test_multiple_pastes_append_and_continue_numbering(self):
+        self.app.root.clip = '"%s\n%s"' % (IDS["a"], IDS["b"])
+        self.app._on_paste_click()
+        self.assertEqual(self.app.plan["group_titles"], ["01"])
+        self.app.root.clip = IDS["c"]
+        self.app._on_paste_click()
+        self.app.root.clip = '"%s\n%s"' % (IDS["d"], IDS["e"])
+        self.app._on_paste_click()
+        plan = self.app.plan
+        self.assertEqual([e["tag"] for e in plan["entries"]], ["01-1", "01-2", "02", "03-1", "03-2"])
+        self.assertIn("已添加 2 个文件，共 5 个", self.app.status_var.get())
+
+    def test_unclosed_quote_in_one_paste_does_not_swallow_next_paste(self):
+        self.app.root.clip = '"%s\n%s' % (IDS["a"], IDS["b"])
+        self.app._on_paste_click()
+        self.app.root.clip = IDS["c"]
+        self.app._on_paste_click()
+        self.assertEqual([e["tag"] for e in self.app.plan["entries"]], ["01-1", "01-2", "02"])
+
+    def test_paste_after_download_keeps_done_and_only_downloads_new(self):
+        self.app.root.clip = '"%s\n%s"' % (IDS["a"], IDS["b"])
+        self.app._on_paste_click()
+        with patch.object(backend, "download_file", side_effect=self.fake_download()):
+            self.app._on_start()
+        self.assertEqual(self.app.ok_set, {0, 1})
+        self.app.root.clip = "%s\n%s" % (IDS["a"], IDS["c"])  # 其中 a 是重复链接
+        self.app._on_paste_click()
+        self.assertEqual(self.app.ok_set, {0, 1})
+        self.assertEqual(self.app.btn_start.text, "继续下载")
+        calls = []
+
+        def fake(fid, dest, **kw):
+            calls.append(fid)
+            final = dest[:-4] + ".jpg"
+            Path(final).write_bytes(b"x")
+            return True, final
+
+        with patch.object(backend, "download_file", side_effect=fake):
+            self.app._on_start()
+        self.assertEqual(calls, ["c" * 12])  # 重复的 a 直接复制，不再向谷歌请求
+        self.assertEqual(sorted(p.name for p in Path(self.dir.name).iterdir()),
+                         ["01-1.jpg", "01-2.jpg", "02.jpg", "03.jpg"])
+
+    def test_paste_key_works_and_is_debounced(self):
+        self.app._on_paste_key()
+        self.assertEqual(len(self.app.plan["items"]), 14)
+        self.app._on_paste_key()  # 同一次按键触发的第二个事件
+        self.assertEqual(len(self.app.plan["items"]), 14)
+
+    def test_paste_ignored_while_running(self):
+        self.app._on_paste_click()
+        self.app.running = True
+        count = len(self.app.plan["items"])
+        self.app._on_paste_click()
+        self.assertEqual(len(self.app.plan["items"]), count)
+        self.assertIn("正在下载", self.app.status_var.get())
 
 
 class LayoutHelperTests(unittest.TestCase):
