@@ -3,13 +3,16 @@ import argparse
 import hashlib
 from pathlib import Path
 import plistlib
+import shutil
 import subprocess
 import sys
+import tempfile
 import zipfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
 TARGETS = ("windows-x64", "macos-arm64", "macos-x64")
+INSTALL_GUIDE = ROOT / "安装说明.txt"
 
 
 def verify_windows(binary):
@@ -63,26 +66,30 @@ def main():
         verify_windows(binary)
         with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as output:
             output.write(binary, binary.name)
-            output.writestr(
-                "运行说明.txt",
-                "解压后双击 媒体下载器.exe，无需安装 Python。\n"
-                "仅下载有权访问的公开文件，下载后请确认内容来源可信。\n"
-                "图标为葡萄紫云朵与柠檬黄下载箭头。\n",
-            )
+            output.write(INSTALL_GUIDE, INSTALL_GUIDE.name)
     else:
         app = args.dist_dir / "媒体下载器.app"
         verify_macos(app, args.target)
         # ditto preserves the bundle's executable bits, symlinks and signatures.
-        subprocess.run(
-            ["/usr/bin/ditto", "-c", "-k", "--sequesterRsrc", "--keepParent",
-             str(app), str(archive)],
-            check=True,
-        )
+        # The app and the install guide sit side by side at the top of the archive.
+        with tempfile.TemporaryDirectory() as stage:
+            subprocess.run(["/usr/bin/ditto", str(app), str(Path(stage) / app.name)], check=True)
+            shutil.copyfile(INSTALL_GUIDE, Path(stage) / INSTALL_GUIDE.name)
+            subprocess.run(
+                ["/usr/bin/ditto", "-c", "-k", "--sequesterRsrc", stage, str(archive)],
+                check=True,
+            )
 
     with zipfile.ZipFile(archive) as output:
         bad_member = output.testzip()
         if bad_member is not None:
             raise RuntimeError("Archive integrity check failed")
+        # ditto stores UTF-8 names without the UTF-8 flag, so Python reads them as cp437.
+        names = {info.filename if info.flag_bits & 0x800
+                 else info.filename.encode("cp437").decode("utf-8", "replace")
+                 for info in output.infolist()}
+        if INSTALL_GUIDE.name not in names:
+            raise RuntimeError("The install guide is missing from the archive")
     with archive.open("rb") as stream:
         digest = hashlib.file_digest(stream, "sha256").hexdigest()
     checksum = archive.with_suffix(".sha256")

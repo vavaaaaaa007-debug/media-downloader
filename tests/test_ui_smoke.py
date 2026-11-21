@@ -154,6 +154,7 @@ class UiSmokeTests(unittest.TestCase):
             patch.object(backend, "check_certifi", return_value=True),
             patch.object(backend, "_pause"),
             patch.object(ui.threading, "Thread", SyncThread),
+            patch.object(backend, "read_clipboard_html", return_value=None),  # 不读真实剪贴板
         ]
         for p in patches:
             p.start()
@@ -190,6 +191,51 @@ class UiSmokeTests(unittest.TestCase):
         self.assertTrue(self.app.status_var.get().startswith("全部完成"))
         self.assertEqual({"out_dir": self.dir.name}, self.saved[-1])
         self.assertFalse(self.app.running)
+
+    def test_folder_link_paste_expands_to_series(self):
+        folder = "https://drive.google.com/drive/folders/" + "z" * 20
+        self.app.root.clip = IDS["a"] + "\n" + folder
+        media = [("m" * 20, "1.jpg"), ("n" * 20, "2.jpg")]
+        with patch.object(backend, "list_drive_folder", return_value=(media, 0)):
+            self.app._on_paste_click()
+        self.assertFalse(self.app.reading_folder)
+        self.assertEqual([e["tag"] for e in self.app.plan["items"]], ["01", "02-1", "02-2"])
+
+    def test_unreadable_folder_shows_warning(self):
+        self.app.root.clip = "https://drive.google.com/drive/folders/" + "z" * 20
+        with patch.object(backend, "list_drive_folder", side_effect=ValueError("没有访问权限")):
+            self.app._on_paste_click()
+        self.assertFalse(self.app.reading_folder)
+        self.assertIsNone(self.app.plan)
+        self.assertTrue(any("没有访问权限" in msg for _, msg in self.box.calls))
+
+    def test_table_paste_uses_hyperlinks_and_rows_as_series(self):
+        f = "https://drive.google.com/uc?export=download&amp;id=%s"
+        cell = '<td><a class="in-cell-link" href="%s">%s</a></td>'
+        page = ("<table><tbody><tr>" + cell % (f % ("a" * 20), "https://x") + cell % (f % ("b" * 20), "https://y")
+                + "</tr><tr>" + cell % (f % ("c" * 20), "点击下载") + "</tr></tbody></table>")
+        self.app.root.clip = "https://x\thttps://y\n点击下载"
+        with patch.object(backend, "read_clipboard_html", return_value=page):
+            self.app._on_paste_click()
+        self.assertEqual([(e["tag"], e["fid"]) for e in self.app.plan["items"]],
+                         [("01-1", "a" * 20), ("01-2", "b" * 20), ("02", "c" * 20)])
+
+    def test_mixed_images_and_videos_go_to_two_folders(self):
+        self.app._on_paste_click()
+
+        def fake(fid, dest, **kw):
+            final = dest[:-4] + (".mp4" if fid == "d" * 12 else ".jpg")
+            Path(final).write_bytes(b"x")
+            return True, final
+        with patch.object(backend, "download_file", side_effect=fake):
+            self.app._on_start()
+        root = Path(self.dir.name)
+        videos = sorted(p.name for p in (root / "视频").iterdir())
+        images = sorted(p.name for p in (root / "图片").iterdir())
+        self.assertIn("03.mp4", videos)
+        self.assertIn("01-1.jpg", images)
+        self.assertEqual(len(videos) + len(images), 14)
+        self.assertEqual(sorted(p.name for p in root.iterdir()), ["图片", "视频"])
 
     def test_rate_limit_then_continue(self):
         self.app._on_paste_click()

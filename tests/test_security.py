@@ -107,4 +107,20 @@ class SecurityTests(unittest.TestCase):
             self.assertEqual(Path(str(dest)+".mp4").read_bytes(), b"original")
             self.assertFalse(any(p.name.startswith(".fbdl-") for p in Path(d).iterdir()))
 
+class OpenFolderTests(unittest.TestCase):
+    def test_only_directories_are_opened(self):
+        import tempfile
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as d:
+            exe = os.path.join(d, "evil.exe")
+            open(exe, "wb").close()
+            with patch("subprocess.Popen") as popen, patch.object(app.os, "startfile", create=True) as start:
+                app._open_folder(exe)
+                app._open_folder(os.path.join(d, "missing"))
+                app._open_folder("")
+                self.assertFalse(popen.called or start.called)
+                app._open_folder(d)
+                self.assertTrue(popen.called or start.called)
+
+
 if __name__ == "__main__": unittest.main()

@@ -326,6 +326,51 @@ MEDIA_EXTENSIONS = set(CONTENT_TYPE_TO_EXT.values()) | VIDEO_EXTENSIONS | {
 }
 
 
+VIDEO_LIKE_EXTENSIONS = VIDEO_EXTENSIONS | {".3gp", ".mpeg", ".mpg"}
+IMAGE_EXTENSIONS = MEDIA_EXTENSIONS - VIDEO_LIKE_EXTENSIONS
+IMAGE_FOLDER, VIDEO_FOLDER = "图片", "视频"
+
+
+def media_kind(path):
+    """按扩展名判断是 "image"、"video"，未知类型（如 .bin）返回 None。"""
+    ext = os.path.splitext(path)[1].lower()
+    if ext in VIDEO_LIKE_EXTENSIONS:
+        return "video"
+    if ext in IMAGE_EXTENSIONS:
+        return "image"
+    return None
+
+
+def sort_media_files(paths, out_dir):
+    """一批文件里同时有图片和视频时，分别移到 out_dir/图片 和 out_dir/视频；
+    只有一种时不动。只处理保存文件夹（及这两个子文件夹）里的文件，不覆盖同名文件。
+    返回 {原路径: 新路径}，只含实际移动了的文件。可重复调用：已分好的文件不会再动。"""
+    out_dir = os.path.abspath(out_dir)
+    folders = {"image": os.path.join(out_dir, IMAGE_FOLDER),
+               "video": os.path.join(out_dir, VIDEO_FOLDER)}
+    allowed = {out_dir} | set(folders.values())
+    files = {}
+    for path in paths:
+        path = os.path.abspath(path)
+        kind = media_kind(path)
+        if (kind and os.path.dirname(path) in allowed
+                and stat.S_ISREG(os.lstat(path).st_mode if os.path.lexists(path) else 0)):
+            files[path] = kind
+    if set(files.values()) != {"image", "video"}:
+        return {}
+    moved = {}
+    for path, kind in files.items():
+        folder = folders[kind]
+        if os.path.dirname(path) == folder:
+            continue
+        try:
+            os.makedirs(folder, exist_ok=True)
+            moved[path] = _publish_download(path, os.path.join(folder, os.path.basename(path)))
+        except OSError:
+            pass  # 移动失败的文件留在原处，不影响其他文件
+    return moved
+
+
 def _get_ext_from_response(resp, file_id):
     """从响应头推断文件扩展名。"""
     cd = resp.headers.get("Content-Disposition", "")
@@ -625,6 +670,280 @@ def _group_links(lines):
         if ends:
             current = None
     return [g for g in groups if g]
+
+
+def _join_groups(groups):
+    """_group_links 的逆操作：把系列重新写成引号配对的行（单个文件不加引号）。"""
+    out = []
+    for group in groups:
+        if len(group) == 1:
+            out.append(group[0])
+        elif group:
+            out.append('"' + group[0])
+            out.extend(group[1:-1])
+            out.append(group[-1] + '"')
+    return out
+
+
+# ------------------------------------------------------------------ 表格粘贴
+_URL_IN_TEXT = re.compile(r"https://[^\s<>\"]+")
+_HTML_LIMIT = 20 * 1024 * 1024
+
+
+def _cell_links(hrefs, text):
+    """一个单元格里的链接：优先用超链接地址（“点击下载”这类文字背后的链接），
+    没有超链接时用格子里的文字（每行一个）。"""
+    out = []
+    for h in hrefs:
+        if h and h not in out:
+            out.append(h)
+    if out:
+        return out
+    # 标题、备注、图片等不是链接的格子不算进系列，避免把编号挤歪
+    return [line.strip() for line in text.splitlines() if "https://" in line]
+
+
+def rows_from_html(page):
+    """从表格复制出来的网页格式（Google 表格 / Excel / Numbers）里取链接：
+    每一行是一个系列。不是表格时返回 None。"""
+    if not page or "<tr" not in page.lower() or len(page) > _HTML_LIMIT:
+        return None
+    from html.parser import HTMLParser
+
+    class _Table(HTMLParser):
+        def __init__(self):
+            super().__init__(convert_charrefs=True)
+            self.rows, self.row, self.cell = [], None, None
+
+        def _close_cell(self):
+            if self.cell is not None and self.row is not None:
+                self.row.extend(_cell_links(self.cell[0], "".join(self.cell[1])))
+            self.cell = None
+
+        def _close_row(self):
+            self._close_cell()
+            if self.row:
+                self.rows.append(self.row)
+            self.row = None
+
+        def handle_starttag(self, tag, attrs):
+            if tag == "tr":
+                self._close_row()
+                self.row = []
+            elif tag in ("td", "th"):
+                self._close_cell()
+                if self.row is None:
+                    self.row = []
+                self.cell = ([], [])
+            elif tag == "a" and self.cell is not None:
+                href = (dict(attrs).get("href") or "").strip()
+                if href.startswith("https://"):
+                    self.cell[0].append(href)
+            elif tag == "br" and self.cell is not None:
+                self.cell[1].append("\n")
+
+        def handle_endtag(self, tag):
+            if tag in ("td", "th"):
+                self._close_cell()
+            elif tag in ("tr", "table"):
+                self._close_row()
+
+        def handle_data(self, data):
+            if self.cell is not None:
+                self.cell[1].append(data)
+
+    parser = _Table()
+    try:
+        parser.feed(page)
+        parser.close()
+    except Exception:
+        return None
+    parser._close_row()
+    return parser.rows or None
+
+
+def rows_from_tsv(text):
+    """表格复制出来的纯文字：格子之间是 Tab，一格多行时被引号包住。每一行是一个系列。"""
+    import csv
+    import io
+    rows = []
+    for cells in csv.reader(io.StringIO(text), delimiter="\t", quotechar='"'):
+        row = []
+        for cell in cells:
+            row.extend(_cell_links([], cell))
+        if row:
+            rows.append(row)
+    return rows
+
+
+def lines_from_paste(text, page=None):
+    """把一次粘贴整理成 build_plan 用的行：
+    - 有表格网页格式时按表格读，能拿到“点击下载”这类超链接背后的地址；
+    - 纯文字里有 Tab（从表格复制）时按行分格；
+    - 否则保持原来的规则（每行一个，引号包住的多行是一个系列）。
+    表格里同一行的所有链接算一个系列。"""
+    rows = rows_from_html(page) if page else None
+    if rows is None and "\t" in (text or ""):
+        rows = rows_from_tsv(text)
+    if rows is None:
+        return (text or "").splitlines()
+    return _join_groups(rows)
+
+
+def read_clipboard_html():
+    """读取系统剪贴板里的网页格式（从表格复制时才有）；读不到返回 None。"""
+    try:
+        if sys.platform == "darwin":
+            import subprocess
+            out = subprocess.run(["/usr/bin/osascript", "-e", "the clipboard as «class HTML»"],
+                                 capture_output=True, text=True, timeout=5)
+            m = re.search(r"«data HTML([0-9A-Fa-f]*)»", out.stdout or "")
+            if out.returncode != 0 or not m or len(m.group(1)) > 2 * _HTML_LIMIT:
+                return None
+            return bytes.fromhex(m.group(1)).decode("utf-8", "replace")
+        if sys.platform == "win32":
+            return _read_windows_clipboard_html()
+    except Exception:
+        return None
+    return None
+
+
+def _read_windows_clipboard_html():
+    import ctypes
+    from ctypes import wintypes
+    user32, kernel32 = ctypes.windll.user32, ctypes.windll.kernel32
+    user32.RegisterClipboardFormatW.argtypes = [wintypes.LPCWSTR]
+    user32.GetClipboardData.restype = wintypes.HANDLE
+    user32.GetClipboardData.argtypes = [wintypes.UINT]
+    kernel32.GlobalLock.restype = ctypes.c_void_p
+    kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+    kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+    kernel32.GlobalSize.restype = ctypes.c_size_t
+    kernel32.GlobalSize.argtypes = [wintypes.HGLOBAL]
+    fmt = user32.RegisterClipboardFormatW("HTML Format")
+    if not fmt or not user32.OpenClipboard(None):
+        return None
+    try:
+        handle = user32.GetClipboardData(fmt)
+        if not handle:
+            return None
+        size = kernel32.GlobalSize(handle)
+        if not size or size > _HTML_LIMIT:
+            return None
+        ptr = kernel32.GlobalLock(handle)
+        if not ptr:
+            return None
+        try:
+            data = ctypes.string_at(ptr, size)
+        finally:
+            kernel32.GlobalUnlock(handle)
+    finally:
+        user32.CloseClipboard()
+    return data.split(b"\0", 1)[0].decode("utf-8", "replace")
+
+
+# ------------------------------------------------------------------ 文件夹链接
+_FOLDER_RE = re.compile(
+    r"^https://drive\.google\.com/(?:drive/(?:u/\d+/)?)?folders/([A-Za-z0-9_-]{10,})(?:[/?#]\S*)?$")
+_FOLDER_PAGE_LIMIT = 20 * 1024 * 1024
+_FOLDER_TYPE = "application/vnd.google-apps.folder"
+
+
+def extract_folder_id(text):
+    """Google Drive 文件夹分享链接 -> 文件夹 ID；不是文件夹链接时返回 None。"""
+    m = _FOLDER_RE.match((text or "").strip())
+    return m.group(1) if m else None
+
+
+def has_folder_links(lines):
+    return any(extract_folder_id(link) for g in _group_links(lines) for link in g)
+
+
+def _natural_key(name):
+    """按人眼习惯排序：5 (2) 排在 5 (10) 前面。"""
+    return [(0, int(p), "") if p.isdigit() else (1, 0, p.lower())
+            for p in re.split(r"(\d+)", name)]
+
+
+def parse_folder_page(page):
+    """解析公开文件夹的列表页，返回 (媒体文件 [(文件ID, 文件名)], 跳过的项目数)。"""
+    import html as _html
+    if "flip-entries" not in page:
+        raise ValueError("谷歌没有返回文件夹列表")
+    media, skipped = [], 0
+    for chunk in page.split('<div class="flip-entry" id="entry-')[1:]:
+        fid = chunk.split('"', 1)[0]
+        if not re.fullmatch(r"[A-Za-z0-9_-]{10,}", fid):
+            continue
+        href = re.search(r'href="([^"]*)"', chunk)
+        title = re.search(r'class="flip-entry-title">([^<]*)<', chunk)
+        mime = re.search(r'/type/([A-Za-z0-9.+-]+/[A-Za-z0-9.+-]+)', chunk)
+        name = _html.unescape(title.group(1)).strip() if title else fid
+        mime = mime.group(1).lower() if mime else ""
+        ext = os.path.splitext(name)[1].lower()
+        is_folder = mime == _FOLDER_TYPE or (href and "/folders/" in href.group(1))
+        if not is_folder and (mime.startswith(("image/", "video/")) or ext in MEDIA_EXTENSIONS):
+            media.append((fid, name))
+        else:
+            skipped += 1  # 子文件夹、文档等非图片/视频不下载
+    media.sort(key=lambda m: _natural_key(m[1]))
+    return media, skipped
+
+
+def list_drive_folder(folder_id, timeout=None):
+    """读取公开文件夹（知道链接的任何人可查看）里的图片和视频，按文件名排序。"""
+    url = "https://drive.google.com/embeddedfolderview?id=" + urllib.parse.quote(folder_id)
+    try:
+        with _open_drive_url(url, timeout or _NET_TIMEOUT) as resp:
+            data = resp.read(_FOLDER_PAGE_LIMIT + 1)
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            raise ValueError("文件夹不存在或已被删除")
+        if e.code in (401, 403):
+            raise ValueError(_PERMISSION_MESSAGE)
+        raise ValueError("读取文件夹失败（HTTP %d）" % e.code)
+    except urllib.error.URLError as e:
+        if "重定向" in str(getattr(e, "reason", e)):  # 私有文件夹会被转到登录页
+            raise ValueError(_PERMISSION_MESSAGE)
+        raise ValueError("读取文件夹失败：%s" % _describe_network_error(e))
+    except (OSError, socket.timeout) as e:
+        raise ValueError("读取文件夹失败：%s" % _describe_network_error(e))
+    if len(data) > _FOLDER_PAGE_LIMIT:
+        raise ValueError("文件夹列表过大，无法读取")
+    try:
+        return parse_folder_page(data.decode("utf-8", "replace"))
+    except ValueError:
+        raise ValueError(_PERMISSION_MESSAGE + "（或文件夹链接不正确）")
+
+
+def expand_folder_links(lines, lister=None):
+    """把文件夹链接展开成里面每张图片的链接，整个文件夹算一个系列（01-1、01-2 …）。
+    返回 (新的行, 说明文字列表, 出错的说明文字列表)。读取失败的文件夹保留原链接，
+    之后会显示为“无法识别的链接”。会访问网络，请在后台线程调用。"""
+    lister = lister or list_drive_folder
+    groups, notes, errors = [], [], []
+    for group in _group_links(lines):
+        new_group = []
+        for link in group:
+            folder_id = extract_folder_id(link)
+            if not folder_id:
+                new_group.append(link)
+                continue
+            try:
+                media, skipped = lister(folder_id)
+            except ValueError as e:
+                errors.append("文件夹 %s…：%s" % (folder_id[:14], e))
+                new_group.append(link)
+                continue
+            extra = "，跳过 %d 个非图片/视频项目（含子文件夹）" % skipped if skipped else ""
+            if not media:
+                errors.append("文件夹 %s… 里没有图片或视频%s" % (folder_id[:14], extra))
+                continue
+            notes.append("文件夹 %s… 找到 %d 个文件%s" % (folder_id[:14], len(media), extra))
+            new_group.extend("https://drive.google.com/file/d/%s/view" % fid for fid, _ in media)
+        if new_group:
+            groups.append(new_group)
+    return _join_groups(groups), notes, errors
 
 
 _START_RE = re.compile(r"^\s*(-?\d+)\s*(?:[-－–—]\s*(\d+))?\s*$")
@@ -1044,7 +1363,8 @@ def main_classic():
             var.set(d)
 
     def run():
-        raw = txt.get("1.0", "end").strip().splitlines()
+        # 从表格复制的内容（格子之间是 Tab）按行分系列；其余保持每行一个
+        raw = lines_from_paste(txt.get("1.0", "end").strip())
         # 保留引号：引号包住的多行链接是同一个系列。
         links = [x.strip() for x in raw if x.strip()]
         if not links:
@@ -1116,8 +1436,16 @@ def main_classic():
             root.after(0, lambda: bar.configure(value=i / total * 100))
 
         def worker():
+            batch_links = links
+            if has_folder_links(links):
+                status_cb("正在读取 Google Drive 文件夹里的文件列表 …")
+                batch_links, notes, errors = expand_folder_links(links)
+                for line in notes + errors:
+                    root.after(0, lambda line=line: log_msg("[文件夹] " + line))
+            saved = []
             ok, results = download_batch(
-                links, start, out_dir, zero_pad=zero_pad,
+                batch_links, start, out_dir, zero_pad=zero_pad,
+                result_cb=lambda item, success, info: success and saved.append(info),
                 status_cb=status_cb, file_progress_cb=file_cb,
                 overall_progress_cb=overall_cb,
                 stop_flag=lambda: stop_requested["v"],
@@ -1132,6 +1460,10 @@ def main_classic():
                         log_msg("[失败] 序号 %s -> %s" % (num, info))
                     else:
                         log_msg("[成功] 序号 %s -> %s" % (num, info))
+                moved = sort_media_files(saved, out_dir)
+                if moved:
+                    log_msg("[分类] 这批同时有图片和视频，已把 %d 个文件分别放进“%s”“%s”文件夹"
+                            % (len(moved), IMAGE_FOLDER, VIDEO_FOLDER))
                 log_msg("完成：成功 %d 个。" % ok)
                 status_var.set("完成：成功 %d 个，保存到 %s" % (ok, out_dir))
                 bar["value"] = 100
@@ -1156,6 +1488,9 @@ def main_classic():
 
 def _open_folder(path):
     import subprocess
+    # 只打开文件夹：Windows 的 startfile 遇到文件会直接运行它（例如保存位置被填成某个 .exe）
+    if not path or not os.path.isdir(path):
+        return
     try:
         if sys.platform.startswith("win"):
             os.startfile(path)  # noqa

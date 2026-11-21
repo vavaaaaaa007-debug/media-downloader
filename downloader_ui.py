@@ -570,7 +570,9 @@ class App:
         self.raw_lines = None
         self.plan = None
         self.ok_set = set()
+        self.media_paths = {}  # 序号 -> 已下载文件路径（用于按图片/视频分文件夹）
         self.running = False
+        self.reading_folder = False
         self.stop_requested = False
         self.done_cache = {}      # 已下载过的链接，继续下载时不再重复请求
         self._last_key_paste = 0.0
@@ -680,6 +682,7 @@ class App:
         self.plan = None
         self.raw_lines = None
         self.ok_set = set()
+        self.media_paths = {}  # 序号 -> 已下载文件路径（用于按图片/视频分文件夹）
         self.done_cache = {}
         self.progress.set(0)
         self.status_var.set("就绪")
@@ -711,14 +714,19 @@ class App:
         if self.running:
             self.status_var.set("正在下载，下载结束或停止后才能继续粘贴")
             return
+        if self.reading_folder:
+            self.status_var.set("正在读取文件夹，请稍等")
+            return
         try:
             text = self.root.clipboard_get()
         except tk.TclError:
             text = ""
-        if not text.strip():
+        # 从表格复制时，“点击下载”这类超链接只在网页格式里，纯文字里只有文字
+        page = self.b.read_clipboard_html()
+        if not text.strip() and not page:
             messagebox.showinfo("提示", "剪贴板里没有文字。请先复制链接，再粘贴。")
             return
-        self.add_text(text)
+        self.add_text(text, page)
 
     def _on_paste_key(self, _event=None):
         try:
@@ -735,30 +743,56 @@ class App:
 
     def _canonical(self, lines):
         """把一次粘贴的内容整理成引号完全配对的行，避免上一次没闭合的引号吞掉下一次粘贴。"""
-        out = []
-        for group in self.b._group_links(lines):
-            if len(group) == 1:
-                out.append(group[0])
-            else:
-                out.append('"' + group[0])
-                out.extend(group[1:-1])
-                out.append(group[-1] + '"')
-        return out
+        return self.b._join_groups(self.b._group_links(lines))
 
-    def add_text(self, text):
-        """接收粘贴的文字：第一次粘贴建立列表，之后的粘贴接在后面，编号继续往下排。"""
-        lines = self._canonical(text.splitlines())
+    def add_text(self, text, page=None):
+        """接收粘贴的文字：第一次粘贴建立列表，之后的粘贴接在后面，编号继续往下排。
+        从表格复制时同一行的链接是一个系列（page 是剪贴板里的网页格式，可为空）。
+        含文件夹链接时，先在后台读取文件夹里的文件列表，读完再加入。"""
+        lines = self.b.lines_from_paste(text, page)
+        if not self.b.has_folder_links(lines):
+            self._add_lines(lines)
+            return
+        if self.reading_folder:
+            return
+        self.reading_folder = True
+        self.status_var.set("正在读取 Google Drive 文件夹里的文件列表 …")
+
+        def work():
+            try:
+                result, error = self.b.expand_folder_links(lines), None
+            except Exception as e:  # 防止后台异常导致一直停在“读取中”
+                result, error = None, e
+            self.root.after(0, lambda: self._folder_read(result, error))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _folder_read(self, result, error):
+        self.reading_folder = False
+        if error is not None:
+            self.status_var.set("读取文件夹失败")
+            messagebox.showerror("错误", "读取文件夹失败：%s" % error)
+            return
+        lines, notes, errors = result
+        for note in notes + errors:
+            self._log_line("[文件夹] " + note)
+        if errors:
+            messagebox.showwarning("文件夹", "\n".join(errors))
+        self._add_lines(lines)
+
+    def _add_lines(self, lines):
+        lines = self._canonical(lines)
         combined = (self.raw_lines or []) + lines
         plan = self._make_plan(combined) if lines else None
         before = len(self.plan["items"]) if self.plan else 0
         if plan is None or len(plan["items"]) <= before:
-            messagebox.showwarning("提示", "没有识别到可用的链接。请确认复制的是 Google Drive 或 Facebook Reels 链接。")
+            messagebox.showwarning("提示", "没有识别到可用的链接。请确认复制的是 Google Drive（文件或文件夹）或 Facebook Reels 链接。")
             return
         first = self.plan is None
         added = len(plan["items"]) - before
         self.raw_lines = combined
         if first:
             self.ok_set = set()
+            self.media_paths = {}  # 序号 -> 已下载文件路径（用于按图片/视频分文件夹）
             self.progress.set(0)
         self._apply_plan(plan, keep_status=not first)
         self._show_cards()
@@ -808,6 +842,7 @@ class App:
         if plan is None:
             return
         self.ok_set = set()  # 命名规则变了，之前的完成标记不再适用
+        self.media_paths = {}  # 序号 -> 已下载文件路径（用于按图片/视频分文件夹）
         self.done_cache = {}
         self._apply_plan(plan)
         self._refresh_start_button()
@@ -878,7 +913,7 @@ class App:
         self.root.destroy()
 
     def _on_start(self):
-        if self.running:
+        if self.running or self.reading_folder:
             return
         if not self.plan:
             messagebox.showwarning("提示", "请先粘贴至少一个链接。")
@@ -892,6 +927,7 @@ class App:
             if not messagebox.askyesno("提示", "这批文件已经全部下载完成。\n要重新下载一遍吗？（同名文件会自动加上 (1)，不会覆盖）"):
                 return
             self.ok_set = set()
+            self.media_paths = {}  # 序号 -> 已下载文件路径（用于按图片/视频分文件夹）
             self.cards.reset_status()
             pending = self._pending_items()
         if any(it["kind"] == "drive" for it in pending) and not self.b.check_certifi():
@@ -987,6 +1023,7 @@ class App:
         index = item["index"]
         if success:
             self.ok_set.add(index)
+            self.media_paths[index] = info
             self.cards.set_status(index, "完成", "✓ 完成")
             self._log_line("[成功] 序号 %s -> %s" % (item["tag"], os.path.basename(info)))
         elif info == self.b._NOT_RUN_MESSAGE:
@@ -998,6 +1035,7 @@ class App:
 
     def _finish(self, count, total, out_dir, results):
         self.running = False
+        self._sort_media(out_dir)
         for it in self._pending_items():
             index = it["index"]
             if self.cards.status.get(index, ("",))[0] in ("等待", "下载中"):
@@ -1012,6 +1050,22 @@ class App:
         self.status_var.set(msg)
         self.progress.set(100 if not remaining else self.progress.value)
         self._refresh_start_button()
+
+    def _sort_media(self, out_dir):
+        """这批文件同时有图片和视频时，分到“图片”“视频”两个文件夹。"""
+        try:
+            moved = self.b.sort_media_files(list(self.media_paths.values()), out_dir)
+        except Exception as e:  # 分类失败不影响已下载的文件
+            self._log_line("[分类] 未能按图片/视频分文件夹：%s" % e)
+            return
+        if not moved:
+            return
+        self.media_paths = {i: moved.get(p, p) for i, p in self.media_paths.items()}
+        for key, path in list(self.done_cache.items()):
+            if path in moved:
+                self.done_cache[key] = moved[path]
+        self._log_line("[分类] 这批同时有图片和视频，已把 %d 个文件分别放进“%s”“%s”文件夹"
+                       % (len(moved), self.b.IMAGE_FOLDER, self.b.VIDEO_FOLDER))
 
     def _crash(self, error):
         self.running = False

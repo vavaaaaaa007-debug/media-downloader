@@ -299,5 +299,192 @@ class SettingsTests(unittest.TestCase):
             self.assertEqual(app.load_settings(cfg), {})
 
 
+def folder_entry(fid, name, mime):
+    href = ("https://drive.google.com/drive/folders/%s" % fid if mime.endswith("folder")
+            else "https://drive.google.com/file/d/%s/view?usp=drive_web" % fid)
+    return ('<div class="flip-entry" id="entry-%s" tabindex="0" role="link"><div class="flip-entry-info">'
+            '<a href="%s" target="_blank"><div class="flip-entry-list-icon"><img src="https://drive-thirdparty'
+            '.googleusercontent.com/16/type/%s" alt=""/></div><div class="flip-entry-title">%s</div></a></div>'
+            '</div>' % (fid, href, mime, name))
+
+
+def folder_page(entries):
+    return ('<html><body><div class="flip-entries">%s</div></body></html>'
+            % "".join(folder_entry(*e) for e in entries))
+
+
+FOLDER_URL = "https://drive.google.com/drive/folders/1zg6LP2iR5y4ERfYlHmOr7u4dLwgQUMrF"
+
+
+class FolderLinkTests(unittest.TestCase):
+    def test_folder_id_extraction(self):
+        fid = "1zg6LP2iR5y4ERfYlHmOr7u4dLwgQUMrF"
+        for link in (FOLDER_URL, FOLDER_URL + "?usp=sharing", FOLDER_URL + "?usp=drive_link",
+                     "https://drive.google.com/drive/u/0/folders/" + fid, "  " + FOLDER_URL + "  "):
+            self.assertEqual(app.extract_folder_id(link), fid, link)
+        for link in ("https://drive.google.com/file/d/%s/view" % fid, "http://drive.google.com/drive/folders/" + fid,
+                     "https://evil.com/drive/folders/" + fid, fid, ""):
+            self.assertIsNone(app.extract_folder_id(link), link)
+        self.assertTrue(app.has_folder_links(['"' + FOLDER_URL + '"']))
+        self.assertFalse(app.has_folder_links(["https://drive.google.com/file/d/%s/view" % fid]))
+
+    def test_parse_keeps_media_in_natural_name_order(self):
+        page = folder_page([
+            ("a" * 20, "5.png", "image/png"),
+            ("b" * 20, "5 (10).jpg", "image/jpeg"),
+            ("c" * 20, "5 (2).webp", "image/webp"),
+            ("d" * 20, "sub", "application/vnd.google-apps.folder"),
+            ("e" * 20, "notes.pdf", "application/pdf"),
+            ("f" * 20, "clip.mp4", "video/mp4"),
+            ("g" * 20, "A &amp; B.jpg", "image/jpeg"),
+        ])
+        media, skipped = app.parse_folder_page(page)
+        self.assertEqual([n for _, n in media], ["5 (2).webp", "5 (10).jpg", "5.png", "A & B.jpg", "clip.mp4"])
+        self.assertEqual(media[0][0], "c" * 20)
+        self.assertEqual(skipped, 2)
+
+    def test_non_folder_page_is_rejected(self):
+        with self.assertRaises(ValueError):
+            app.parse_folder_page("<html>Sign in</html>")
+
+    def test_list_folder_maps_login_redirect_to_permission_message(self):
+        err = urllib.error.URLError("拒绝非 Google HTTPS 下载重定向")
+        with patch.object(app, "_open_drive_url", side_effect=err):
+            with self.assertRaisesRegex(ValueError, "没有访问权限"):
+                app.list_drive_folder("x" * 20)
+
+    def test_list_folder_reads_page(self):
+        page = folder_page([("a" * 20, "1.jpg", "image/jpeg")])
+        with patch.object(app, "_open_drive_url", return_value=Page(page)):
+            self.assertEqual(app.list_drive_folder("x" * 20), ([("a" * 20, "1.jpg")], 0))
+
+    def test_folder_becomes_one_series(self):
+        lister = lambda fid: ([("p" * 20, "1.jpg"), ("q" * 20, "2.jpg"), ("r" * 20, "3.jpg")], 1)
+        single = "https://drive.google.com/uc?export=download&id=" + "s" * 20
+        lines, notes, errors = app.expand_folder_links([single, FOLDER_URL, single], lister=lister)
+        self.assertEqual(errors, [])
+        self.assertEqual(len(notes), 1)
+        self.assertIn("3 个文件", notes[0])
+        plan = app.build_plan(lines, 1, zero_pad=2)
+        self.assertEqual([(e["tag"], e["fid"]) for e in plan["items"]],
+                         [("01", "s" * 20), ("02-1", "p" * 20), ("02-2", "q" * 20),
+                          ("02-3", "r" * 20), ("03", "s" * 20)])
+
+    def test_failed_folder_is_reported_and_kept_as_unrecognized(self):
+        def lister(fid):
+            raise ValueError(app._PERMISSION_MESSAGE)
+        lines, notes, errors = app.expand_folder_links([FOLDER_URL], lister=lister)
+        self.assertEqual(notes, [])
+        self.assertIn("没有访问权限", errors[0])
+        plan = app.build_plan(lines, 1)
+        self.assertEqual(plan["items"], [])
+        self.assertEqual(len(plan["skipped"]), 1)
+
+    def test_empty_folder_is_dropped_with_message(self):
+        lines, notes, errors = app.expand_folder_links([FOLDER_URL], lister=lambda fid: ([], 2))
+        self.assertEqual(lines, [])
+        self.assertIn("没有图片或视频", errors[0])
+
+
+class TablePasteTests(unittest.TestCase):
+    F = "https://drive.google.com/uc?export=download&id=%s"
+
+    def html_row(self, *cells):
+        return "<tr>%s</tr>" % "".join("<td>%s</td>" % c for c in cells)
+
+    def a(self, key, text=None):
+        url = (self.F % (key * 20)).replace("&", "&amp;")
+        return '<a class="in-cell-link" href="%s">%s</a>' % (url, text or url)
+
+    def tags(self, lines):
+        return [(e["tag"], e["fid"][0]) for e in app.build_plan(lines, 1, zero_pad=2)["items"]]
+
+    def test_html_rows_are_series_and_hyperlink_text_resolved(self):
+        page = ("<meta charset='utf-8'><table><tbody>"
+                + self.html_row(self.a("a"), self.a("b"))
+                + self.html_row(self.a("c", "点击下载"), self.a("d"), '<img src="x.png">')
+                + self.html_row("标题", self.a("e"))
+                + self.html_row(self.a("f") + "<br>" + self.a("g"), "备注")
+                + "</tbody></table>")
+        lines = app.lines_from_paste("ignored\tplain", page)
+        self.assertEqual(self.tags(lines), [("01-1", "a"), ("01-2", "b"), ("02-1", "c"), ("02-2", "d"),
+                                            ("03", "e"), ("04-1", "f"), ("04-2", "g")])
+
+    def test_multiline_cell_text_without_anchor(self):
+        page = "<table>" + self.html_row(self.F % ("a" * 20) + "<br>" + self.F % ("b" * 20)) + "</table>"
+        self.assertEqual(self.tags(app.lines_from_paste("", page)), [("01-1", "a"), ("01-2", "b")])
+
+    def test_tab_text_rows_are_series(self):
+        text = "%s\t%s\n点击下载\t%s\n\"%s\n%s\"\t%s\n" % (
+            self.F % ("a" * 20), self.F % ("b" * 20), self.F % ("c" * 20),
+            self.F % ("d" * 20), self.F % ("e" * 20), self.F % ("f" * 20))
+        self.assertEqual(self.tags(app.lines_from_paste(text)),
+                         [("01-1", "a"), ("01-2", "b"), ("02", "c"), ("03-1", "d"), ("03-2", "e"), ("03-3", "f")])
+
+    def test_plain_text_keeps_old_rules(self):
+        text = '%s\n"%s\n%s"\n[点击下载](%s)' % (self.F % ("a" * 20), self.F % ("b" * 20),
+                                               self.F % ("c" * 20), self.F % ("d" * 20))
+        self.assertEqual(self.tags(app.lines_from_paste(text, "<p>no table</p>")),
+                         [("01", "a"), ("02-1", "b"), ("02-2", "c"), ("03", "d")])
+
+    def test_folder_link_in_table_row_joins_that_series(self):
+        lines = app.lines_from_paste("%s\t%s" % (self.F % ("a" * 20), FOLDER_URL))
+        lines, _, _ = app.expand_folder_links(lines, lister=lambda fid: ([("p" * 20, "1.jpg")], 0))
+        self.assertEqual(self.tags(lines), [("01-1", "a"), ("01-2", "p")])
+
+    def test_bad_html_falls_back_to_text(self):
+        self.assertEqual(app.lines_from_paste("x\ny", None), ["x", "y"])
+        self.assertIsNone(app.rows_from_html("<div>no rows</div>"))
+
+
+class MediaFolderTests(unittest.TestCase):
+    def make(self, d, *names):
+        paths = []
+        for n in names:
+            path = os.path.join(d, n)
+            Path(path).write_bytes(b"x")
+            paths.append(path)
+        return paths
+
+    def test_mixed_batch_is_split_into_two_folders(self):
+        with tempfile.TemporaryDirectory() as d:
+            paths = self.make(d, "01-1.jpg", "01-2.webp", "02.mp4", "03.MOV", "04.bin")
+            moved = app.sort_media_files(paths, d)
+            self.assertEqual(sorted(os.listdir(os.path.join(d, "图片"))), ["01-1.jpg", "01-2.webp"])
+            self.assertEqual(sorted(os.listdir(os.path.join(d, "视频"))), ["02.mp4", "03.MOV"])
+            self.assertTrue(os.path.exists(os.path.join(d, "04.bin")))  # 未知类型留在原处
+            self.assertEqual(moved[os.path.join(d, "02.mp4")], os.path.join(d, "视频", "02.mp4"))
+            self.assertEqual(len(moved), 4)
+
+    def test_single_kind_batch_is_left_alone(self):
+        with tempfile.TemporaryDirectory() as d:
+            for names in (("01.jpg", "02.png"), ("01.mp4", "02.mov")):
+                paths = self.make(d, *names)
+                self.assertEqual(app.sort_media_files(paths, d), {})
+                for p in paths:
+                    self.assertTrue(os.path.exists(p))
+                    os.remove(p)
+            self.assertEqual(os.listdir(d), [])
+
+    def test_repeat_call_moves_only_new_files_and_never_overwrites(self):
+        with tempfile.TemporaryDirectory() as d:
+            first = self.make(d, "01.jpg", "02.mp4")
+            moved = app.sort_media_files(first, d)
+            os.makedirs(os.path.join(d, "图片"), exist_ok=True)
+            Path(os.path.join(d, "图片", "03.jpg")).write_bytes(b"old")
+            later = self.make(d, "03.jpg")
+            moved2 = app.sort_media_files(list(moved.values()) + later, d)
+            self.assertEqual(list(moved2), [os.path.join(d, "03.jpg")])
+            self.assertEqual(sorted(os.listdir(os.path.join(d, "图片"))), ["01.jpg", "03(1).jpg", "03.jpg"])
+            self.assertEqual(Path(d, "图片", "03.jpg").read_bytes(), b"old")
+
+    def test_files_outside_save_folder_are_ignored(self):
+        with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as other:
+            outside = self.make(other, "x.mp4")
+            inside = self.make(d, "01.jpg")
+            self.assertEqual(app.sort_media_files(outside + inside, d), {})
+            self.assertTrue(os.path.exists(outside[0]))
+
+
 if __name__ == "__main__":
     unittest.main()

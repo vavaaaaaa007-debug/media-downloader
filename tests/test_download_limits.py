@@ -29,6 +29,7 @@ class DownloadLimitTests(unittest.TestCase):
         self.assertEqual(list(output.iterdir()), [])
 
     def test_default_is_ten_gib_and_known_length_rejected_before_read(self):
+        # 第3版起默认上限由 2 GiB 调整为 10 GiB（大视频）；仍须在读取正文前拒绝超限文件
         self.assertEqual(app.DEFAULT_MAX_BYTES, 10 * 1024 ** 3)
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)
